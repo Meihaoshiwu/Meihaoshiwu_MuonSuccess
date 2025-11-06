@@ -1,0 +1,197 @@
+import os
+import torch
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset
+from transformers import Qwen2Tokenizer
+from loguru import logger
+from typing import List, Optional
+
+from .config import TOKENIZED_CACHE, MODEL_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
+
+def load_dataset(dataset_name: str):
+    """加载数据集函数"""
+    name2path = {
+        "openwebtext-100k": "Elriggs/openwebtext-100k",
+        "openwebtext": "Skylion007/openwebtext",
+        "wikitext-103": "wikitext",
+        "openwebtext-local_txt": "local_txt"
+    }
+    
+    if dataset_name not in name2path:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    if dataset_name == "openwebtext-local_txt":
+        from datasets import load_dataset as hf_load_dataset
+        dataset = hf_load_dataset(
+            "text", 
+            data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt", 
+            streaming=True,
+            cache_dir=DATASET_CACHE,
+            trust_remote_code=True,  # 避免代码下载检查
+        )
+    else:
+        from datasets import load_dataset as hf_load_dataset
+        dataset = hf_load_dataset(
+            name2path[dataset_name], 
+            cache_dir=DATASET_CACHE,
+        )
+    
+    return dataset
+
+class ExperimentPreparer:
+    def __init__(
+        self,
+        texts: List[str],
+        tokenizer_name: str,
+        cache_dir: str,
+        output_file: str,
+        num_workers: Optional[int] = None,
+        batch_size: int = 500,
+    ):
+        self.texts = texts
+        self.tokenizer_name = tokenizer_name
+        self.cache_dir = cache_dir
+        self.output_file = output_file
+        self.num_workers = max(1, num_workers) if num_workers is not None else min(mp.cpu_count(), 8)
+        self.batch_size = batch_size
+
+    @staticmethod
+    def _tokenize_worker(worker_data):
+        worker_id, text_batches, tokenizer_name, cache_dir = worker_data
+        tokenizer = Qwen2Tokenizer.from_pretrained(
+            tokenizer_name, cache_dir=cache_dir, local_files_only=True
+        )
+        all_tokens = []
+        # 修正：直接遍历 text_batches，不使用 enumerate
+        for text_batch in text_batches:
+            encoded = tokenizer.batch_encode_plus(
+                text_batch,
+                add_special_tokens=True,
+                truncation=False,
+                padding=False,
+                return_tensors=None,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )["input_ids"]
+            for seq in encoded:
+                all_tokens.extend(seq)
+        return worker_id, all_tokens, len(text_batches)
+
+    @staticmethod
+    def _distribute_data(texts, num_workers, batch_size):
+        total = len(texts)
+        per = total // num_workers
+        rem = total % num_workers
+        worker_data = []
+        for wid in range(num_workers):
+            start = wid * per + min(wid, rem)
+            end = start + per + (1 if wid < rem else 0)
+            batches = [texts[i : i + batch_size] for i in range(start, end, batch_size)]
+            worker_data.append((wid, batches))
+        return worker_data
+
+    @staticmethod
+    def _merge_and_save(partial_dir, num_workers, output_file):
+        all_tokens = []
+        for wid in range(num_workers):
+            f = os.path.join(partial_dir, f"worker_{wid}.pt")
+            if os.path.exists(f):
+                data = torch.load(f, weights_only=True)
+                all_tokens.extend(data["tokens"])
+        torch.save(all_tokens, output_file)
+        return all_tokens
+
+    def tokenize(self):
+        if os.path.exists(self.output_file):
+            logger.info(f"Cache hit -> {self.output_file}")
+            return torch.load(self.output_file, weights_only=True)
+
+        os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
+        
+        # 根据 worker 数量选择处理方式
+        if self.num_workers > 1:
+            return self._tokenize_multi_process()
+        else:
+            return self._tokenize_single_process()
+
+    def _tokenize_multi_process(self):
+        """多进程处理"""
+        partial_dir = f"{self.output_file}_partial"
+        os.makedirs(partial_dir, exist_ok=True)
+
+        # 1. 数据划分
+        worker_data = self._distribute_data(self.texts, self.num_workers, self.batch_size)
+        worker_inputs = [(wid, batches, self.tokenizer_name, self.cache_dir)
+                        for wid, batches in worker_data]
+
+        # 2. 并行 tokenize
+        results = []
+        with mp.Pool(self.num_workers) as pool:
+            for wid, tokens, num_batches in pool.imap_unordered(
+                self._tokenize_worker, worker_inputs
+            ):
+                torch.save({"tokens": tokens}, os.path.join(partial_dir, f"worker_{wid}.pt"))
+                results.append((wid, len(tokens)))
+
+        # 3. 合并 & 清理
+        all_tokens = self._merge_and_save(partial_dir, self.num_workers, self.output_file)
+        for wid, _ in results:
+            try:
+                os.remove(os.path.join(partial_dir, f"worker_{wid}.pt"))
+            except FileNotFoundError:
+                pass
+        os.rmdir(partial_dir)
+        logger.info(f"Multi-process tokenization finished -> {len(all_tokens)} tokens")
+        return all_tokens
+
+    def _tokenize_single_process(self):
+        """单进程处理"""
+        logger.info("Using single-process tokenization")
+        
+        # 修正：将 texts 分成批次，与多进程模式保持一致
+        batches = [self.texts[i:i + self.batch_size] for i in range(0, len(self.texts), self.batch_size)]
+        worker_input = (0, batches, self.tokenizer_name, self.cache_dir)
+        
+        # 直接调用 worker 函数
+        _, all_tokens, _ = self._tokenize_worker(worker_input)
+        
+        # 保存结果
+        torch.save(all_tokens, self.output_file)
+        logger.info(f"Single-process tokenization finished -> {len(all_tokens)} tokens")
+        return all_tokens
+
+
+class MoonDataset(Dataset):
+    def __init__(
+        self,
+        dataset_name: str,
+        dataset,  # datasets.DatasetDict
+        tokenizer_name: str = "Qwen/Qwen2.5-0.5B",
+        max_length: int = 512,
+    ):
+        self.dataset_name = dataset_name
+        self.texts = dataset["train"]["text"]
+        self.max_length = max_length
+        self.cache_file = os.path.join(TOKENIZED_CACHE, f"{dataset_name}.bin")
+        self.tokens = []
+        self._tokenize(tokenizer_name)
+
+    def _tokenize(self, tokenizer_name: str):
+        if os.path.exists(self.cache_file):
+            self.tokens = torch.load(self.cache_file, weights_only=True)
+            return
+        os.makedirs(TOKENIZED_CACHE, exist_ok=True)
+        preparer = ExperimentPreparer(
+            texts=self.texts,
+            tokenizer_name=tokenizer_name,
+            cache_dir=MODEL_CACHE,
+            output_file=self.cache_file,
+        )
+        self.tokens = preparer.tokenize()
+
+    def __len__(self):
+        return len(self.tokens) // self.max_length
+
+    def __getitem__(self, idx):
+        start = idx * self.max_length
+        return torch.tensor(self.tokens[start : start + self.max_length], dtype=torch.long)
