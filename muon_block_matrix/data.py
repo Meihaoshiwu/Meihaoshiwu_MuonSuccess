@@ -58,11 +58,23 @@ class ExperimentPreparer:
     @staticmethod
     def _tokenize_worker(worker_data):
         worker_id, text_batches, tokenizer_name, cache_dir = worker_data
-        tokenizer = Qwen2Tokenizer.from_pretrained(
-            tokenizer_name, cache_dir=cache_dir, local_files_only=True
-        )
+        try:
+            # 首先尝试从缓存加载
+            tokenizer = Qwen2Tokenizer.from_pretrained(
+                tokenizer_name, 
+                cache_dir=cache_dir,
+                local_files_only=True  # 只从本地加载
+            )
+        except OSError:
+            # 如果缓存中没有，则下载（在跳板机上运行）
+            print(f"⚠️  缓存中未找到 {tokenizer_name}，开始下载...")
+            tokenizer = Qwen2Tokenizer.from_pretrained(
+                tokenizer_name,
+                cache_dir=cache_dir  # 下载到缓存目录
+            )
+            print(f"✅ 已下载到缓存: {cache_dir}")
+
         all_tokens = []
-        # 修正：直接遍历 text_batches，不使用 enumerate
         for text_batch in text_batches:
             encoded = tokenizer.batch_encode_plus(
                 text_batch,
@@ -127,7 +139,7 @@ class ExperimentPreparer:
         # 2. 并行 tokenize
         results = []
         with mp.Pool(self.num_workers) as pool:
-            for wid, tokens, num_batches in pool.imap_unordered(
+            for wid, tokens, _ in pool.imap_unordered(
                 self._tokenize_worker, worker_inputs
             ):
                 torch.save({"tokens": tokens}, os.path.join(partial_dir, f"worker_{wid}.pt"))

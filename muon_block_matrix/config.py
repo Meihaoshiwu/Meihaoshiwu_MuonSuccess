@@ -36,7 +36,8 @@ class ExperimentConfig():
         max_epochs=DEFAULT_MAX_EPOCHS,
         lr=DEFAULT_LR,
         wd=DEFAULT_WD, #AdamW使用
-        sampler=None
+        sampler=None,
+        max_tokens=None,  # 新增：最大token数量
         ):
         self.step_func_name = step_func_name
         self.step_func=step_func
@@ -53,10 +54,10 @@ class ExperimentConfig():
         self.lr = lr
         self.wd = wd
         self.sampler = sampler
+        self.max_tokens = max_tokens or float('inf')  # 默认无限制
     
     def __repr__(self):
-        """便于打印配置信息"""
         return (f"ExperimentConfig(step_func_name={self.step_func_name}, "
                 f"model_name={self.model_name}, dataset_name={self.dataset_name}, "
-                f"hidden_size={self.hidden_size}, loss_threshold={self.loss_threshold}, "
+                f"hidden_size={self.hidden_size}, max_tokens={self.max_tokens}, "
                 f"max_epochs={self.max_epochs}, lr={self.lr}, wd={self.wd})")

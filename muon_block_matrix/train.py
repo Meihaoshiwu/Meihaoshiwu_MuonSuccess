@@ -14,7 +14,7 @@ from tqdm import tqdm
 from .config import *
 from .model import create_qwen_model
 from .data import MoonDataset, load_dataset
-from .optimizer import Muon, get_optimizer, STEP_MAP
+from .optimizer import get_optimizer, STEP_MAP
 
 # -------------- 工具函数 --------------
 def get_timestamp():
@@ -39,7 +39,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048,
-                            max_length=512, batch_size=32, rank=0, world_size=1):
+                            max_length=512, per_gpu_batch_size=32, rank=0, world_size=1):
     """获取模型和DataLoader"""
     
     # 加载数据集
@@ -69,18 +69,9 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
     # 4. 传输到 GPU
     # 前3步都在 CPU 上执行，只有第4步涉及 GPU
     num_workers = min(2, mp.cpu_count() // world_size)  # 每个GPU分到少量worker，本来已经做了数据并行的多进程
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=num_workers,
-        pin_memory=True,  # # 将数据直接加载到 GPU 可快速访问的"锁页内存"
-        drop_last=True
-    )
     train_loader = DataLoader( # 只涉及给分配好的数据打包，不涉及分配数据到GPU
         train_dataset, 
-        batch_size=batch_size, 
+        batch_size=per_gpu_batch_size, 
         sampler=sampler,
         shuffle=(sampler is None),
         num_workers=num_workers,           # 使用多进程加载数据
@@ -90,7 +81,7 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
         drop_last=True                     # 丢弃不完整的batch, 分布式训练中特别重要，确保所有 GPU 处理相同大小的 batch
     )
     
-    logger.info(f"DataLoader configured with {num_workers} workers, batch_size {batch_size}")
+    logger.info(f"DataLoader configured with {num_workers} workers, per_gpu_batch_size {per_gpu_batch_size}")
     logger.info(f"Training with {world_size} GPU(s), rank {rank}")
 
     # 创建模型
@@ -151,6 +142,13 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             f"{log_file_path}/{timestamp}_rank{rank}_{step_func_name}.log", 
             mode="w", level="ERROR"
         )
+    
+    # 打印工作进程初始化成功日志
+    if world_size > 1:
+        setup_ddp(rank, world_size)
+        logger.info(f"🎯 Rank {rank}/{world_size} 初始化完成")
+        logger.info(f"🖥️  当前GPU: {torch.cuda.current_device()}")
+        logger.info(f"🌐 进程组: {dist.get_world_size()} 个进程")
 
     # 初始化所有资源
     model, train_loader, sampler = get_model_and_dataloader(
@@ -159,7 +157,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         hidden_size=experiment_config.hidden_size,
         max_position_embeddings=max_position_embeddings,
         max_length=max_length,
-        batch_size=batch_size,
+        per_gpu_batch_size=batch_size//world_size, # 多进程将batch分给多个GPU
         rank=rank,
         world_size=world_size
     )
@@ -231,7 +229,6 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
-# -------------- 用于训练的进程 --------------
 def train_worker(rank, world_size, experiment_config):
     """DDP训练工作进程"""
     with experiment_manager(experiment_config, rank, world_size) as resources:
@@ -246,30 +243,44 @@ def train_worker(rank, world_size, experiment_config):
         model.train()
         losses = []
         total_tokens_trained = 0
-        batch_size = experiment_config.batch_size
+        batch_size = experiment_config.batch_size # 这是全量的batch大小
         max_length = experiment_config.max_length
+        max_tokens = experiment_config.max_tokens
         
-        for epoch in range(experiment_config.max_epochs):
-            # DDP重要：设置epoch以便shuffle正常工作
+        # 计算每个batch的token数
+        tokens_per_batch = batch_size * max_length
+        
+        epoch = 0
+        stop_training = False
+        
+        # 外层循环改为基于epoch，内层检查token数
+        while epoch < experiment_config.max_epochs and not stop_training:
             if sampler:
                 sampler.set_epoch(epoch)
                 
             epoch_losses = []
-            stop_training = False
             
-            # 只在主进程显示进度条
             if rank == 0:
                 epoch_pbar = tqdm(
-                    total=len(train_loader),
-                    desc=f"Epoch {epoch+1}/{experiment_config.max_epochs} - {step_func_name}",
-                    unit="batch",
-                    ncols=100
+                    total=max_tokens,
+                    desc=f"Epoch {epoch+1}",
+                    unit="tokens",
+                    ncols=100,
+                    position=0,
+                    leave=True,
                 )
             
             for step, batch in enumerate(train_loader):
+                # 检查是否达到token限制
+                if total_tokens_trained >= max_tokens:
+                    logger.info(f"🎯 已达到目标token数 {max_tokens}, 停止训练")
+                    stop_training = True
+                    break
+                
                 optimizer.zero_grad()
                 batch = batch.to(device)
-                outputs = model(input_ids=batch, labels=batch)
+                input_ids = batch
+                outputs = model(input_ids=input_ids, labels=input_ids)
                 loss = outputs.loss
                 
                 loss.backward()
@@ -279,45 +290,48 @@ def train_worker(rank, world_size, experiment_config):
                 current_loss = loss.item()
                 epoch_losses.append(current_loss)
                 
-                # 计算当前batch的token数并累加
-                tokens_this_batch = batch_size * max_length
-                total_tokens_trained += tokens_this_batch
+                # 更新token计数
+                total_tokens_trained += tokens_per_batch
                 
-                # 只在主进程更新进度条和日志
                 if rank == 0:
                     epoch_pbar.set_postfix({
                         'loss': f'{current_loss:.4f}',
-                        'tokens': f'{total_tokens_trained:,}',
-                        'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                        'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
+                        'lr': f'{optimizer.param_groups[0]["lr"]:.5e}'
                     })
-                    epoch_pbar.update(1)
+                    epoch_pbar.update(tokens_per_batch)
                     
-                    if step % 100 == 0:
-                        logger.info(
-                            f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Tokens: {total_tokens_trained} "
-                            f"LR: {optimizer.param_groups[0]["lr"]:.6f} Loss: {current_loss:.4f}"
-                        )
+                if step % 100 == 0:
+                    progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
+                    logger.info(
+                        f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
+                        f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
+                        f"Loss: {current_loss:.4f}"
+                    )
             
             if rank == 0:
                 epoch_pbar.close()
                 
                 # 计算epoch平均损失
-                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-                losses.append(avg_epoch_loss)
-                logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 累计token数: {total_tokens_trained}")
-                
-                # 检查是否达到停止条件
-                if avg_epoch_loss < experiment_config.loss_threshold:
-                    stop_training = True
-                    logger.info(f"🎯 {step_func_name} 已达到目标损失 {avg_epoch_loss:.4f} < {experiment_config.loss_threshold}, 停止训练")
+                if epoch_losses:  # 避免除零
+                    avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+                    losses.append(avg_epoch_loss)
+                    logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}")
+                    
+                    # 保留loss阈值检查作为备选停止条件
+                    if avg_epoch_loss < experiment_config.loss_threshold:
+                        stop_training = True
+                        logger.info(f"🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
             
-            # 广播停止训练信号，确保所有进程同步停止
-            if world_size > 1:
+            # 同步停止决策
+            if rank != 0:
+                # 检查主进程已经达到停止条件
                 stop_training = broadcast_stop_signal(stop_training, rank)
-            if stop_training:
-                break
-
+            
+            epoch += 1
+        
         final_loss = losses[-1] if losses else float('inf')
+        logger.info(f"🏁 训练结束 - 总token数: {total_tokens_trained:,}, 最终损失: {final_loss:.4f}")
         return final_loss, losses
 
 def run_experiment(experiment_config: ExperimentConfig):

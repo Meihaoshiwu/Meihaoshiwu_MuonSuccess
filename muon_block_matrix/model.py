@@ -1,3 +1,5 @@
+import os
+from loguru import logger
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 def create_qwen_model(model_name, hidden_size, max_position_embeddings=2048):
