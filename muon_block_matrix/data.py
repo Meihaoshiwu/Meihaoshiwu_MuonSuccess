@@ -14,27 +14,46 @@ def load_dataset(dataset_name: str):
         "openwebtext-100k": "Elriggs/openwebtext-100k",
         "openwebtext": "Skylion007/openwebtext",
         "wikitext-103": "wikitext",
-        "openwebtext-local_txt": "local_txt"
+        "openwebtext-local_txt": "text",
+        "openwebtext-100k-local_txt": "arrow",   # <-- 新增
     }
     
     if dataset_name not in name2path:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
-    if dataset_name == "openwebtext-local_txt":
-        from datasets import load_dataset as hf_load_dataset
+    from datasets import load_dataset as hf_load_dataset
+
+    if dataset_name == "openwebtext-100k-local_txt":
+        # 直接读本地 arrow 文件，**不走网络**
         dataset = hf_load_dataset(
-            "text", 
-            data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt", 
+            "arrow",                         # 内置格式加载器
+            data_files=f"{DATASET_CACHE}/Elriggs___openwebtext-100k/default/0.0.0/2b7bfd980d5227806de62ac735f40712a4881273/openwebtext-100k-train.arrow",
+            split="train",
+            cache_dir=DATASET_CACHE,         # 可选，仍可复用缓存
+        )
+
+    elif dataset_name == "openwebtext-local_txt":
+        dataset = hf_load_dataset(
+            "text",
+            data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt",
             streaming=True,
             cache_dir=DATASET_CACHE,
-            trust_remote_code=True,  # 避免代码下载检查
+            trust_remote_code=True,
         )
+
     else:
-        from datasets import load_dataset as hf_load_dataset
-        dataset = hf_load_dataset(
-            name2path[dataset_name], 
-            cache_dir=DATASET_CACHE,
-        )
+        # 其余数据集走缓存/本地检查
+        try:
+            dataset = hf_load_dataset(
+                name2path[dataset_name],
+                cache_dir=DATASET_CACHE,
+                local_files_only=True
+            )
+        except Exception as e:
+            raise FileNotFoundError(
+                f"数据集 {dataset_name} 在缓存目录 {DATASET_CACHE} 中未找到。"
+                f"请确保数据集已下载到缓存目录。错误详情: {e}"
+            )
     
     return dataset
 
@@ -45,14 +64,13 @@ class ExperimentPreparer:
         tokenizer_name: str,
         cache_dir: str,
         output_file: str,
-        num_workers: Optional[int] = None,
         batch_size: int = 500,
     ):
         self.texts = texts
         self.tokenizer_name = tokenizer_name
         self.cache_dir = cache_dir
         self.output_file = output_file
-        self.num_workers = max(1, num_workers) if num_workers is not None else min(mp.cpu_count(), 8)
+        self.num_workers = min(mp.cpu_count(), 4)
         self.batch_size = batch_size
 
     @staticmethod
@@ -182,7 +200,10 @@ class MoonDataset(Dataset):
         max_length: int = 512,
     ):
         self.dataset_name = dataset_name
-        self.texts = dataset["train"]["text"]
+        if "train" in dataset:
+            self.texts = dataset["train"]["text"]
+        else:
+            self.texts = dataset["text"]        # 本地 arrow 已带 split
         self.max_length = max_length
         self.cache_file = os.path.join(TOKENIZED_CACHE, f"{dataset_name}.bin")
         self.tokens = []

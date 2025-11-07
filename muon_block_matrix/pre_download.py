@@ -4,7 +4,7 @@ import argparse
 from transformers import Qwen2Tokenizer
 from datasets import load_dataset
 from loguru import logger
-from config import MODEL_CACHE, DATASET_CACHE, DATASET_PATH
+from .config import MODEL_CACHE, DATASET_CACHE, DATASET_PATH
 
 def pre_download_resources(dataset_names=None, tokenizer_name="Qwen/Qwen2.5-0.5B"):
     """预下载所有需要的资源"""
