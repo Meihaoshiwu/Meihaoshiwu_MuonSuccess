@@ -8,7 +8,7 @@ from transformers import Qwen2Tokenizer
 from loguru import logger
 from typing import List, Optional
 
-from .config import TOKENIZED_CACHE, MODEL_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
+from .config import TOKENIZED_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
 
 def load_dataset_by_name(dataset_name: str):
     """加载数据集函数"""
@@ -27,7 +27,7 @@ def load_dataset_by_name(dataset_name: str):
         # 直接读本地 arrow 文件，**不走网络**
         dataset = load_dataset(
             "arrow",
-            data_files=f"{DATASET_CACHE}/Elriggs___openwebtext-100k/default/0.0.0/2b7bfd980d5227806de62ac735f40712a4881273/openwebtext-100k-train.arrow",
+            data_files=f"{DATASET_CACHE}/openwebtext-100k-train.arrow",
             split="train",
             cache_dir=DATASET_CACHE,
         )
@@ -62,13 +62,13 @@ class ExperimentPreparer:
         self,
         texts: List[str],
         tokenizer_name: str,
-        cache_dir: str,
+        model_cache_dir: str,
         output_file: str,
         batch_size: int = 500,
     ):
         self.texts = texts
         self.tokenizer_name = tokenizer_name
-        self.cache_dir = cache_dir
+        self.model_cache_dir = model_cache_dir
         self.output_file = output_file
         self.num_workers = min(mp.cpu_count(), 4)
         self.batch_size = batch_size
@@ -83,7 +83,7 @@ class ExperimentPreparer:
                 cache_dir=cache_dir,
                 local_files_only=True  # 只从本地加载
             )
-        except OSError:
+        except (TypeError, OSError):
             # 如果缓存中没有，则下载（在跳板机上运行）
             print(f"⚠️  缓存中未找到 {tokenizer_name}，开始下载...")
             tokenizer = Qwen2Tokenizer.from_pretrained(
@@ -151,7 +151,7 @@ class ExperimentPreparer:
         logger.info("Using multi-process tokenization start")
         # 1. 数据划分
         worker_data = self._distribute_data(self.texts, self.num_workers, self.batch_size)
-        worker_inputs = [(wid, batches, self.tokenizer_name, self.cache_dir)
+        worker_inputs = [(wid, batches, self.tokenizer_name, self.model_cache_dir)
                         for wid, batches in worker_data]
 
         # 2. 并行 tokenize
@@ -180,7 +180,7 @@ class ExperimentPreparer:
         
         # 修正：将 texts 分成批次，与多进程模式保持一致
         batches = [self.texts[i:i + self.batch_size] for i in range(0, len(self.texts), self.batch_size)]
-        worker_input = (0, batches, self.tokenizer_name, self.cache_dir)
+        worker_input = (0, batches, self.tokenizer_name, self.model_cache_dir)
         
         # 直接调用 worker 函数
         _, all_tokens, _ = self._tokenize_worker(worker_input)

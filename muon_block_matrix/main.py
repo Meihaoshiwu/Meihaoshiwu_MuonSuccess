@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
-    parser.add_argument("--dataset", type=str, default="openwebtext-100k")
+    parser.add_argument("--dataset", type=str, default="openwebtext-100k-local_txt")
     parser.add_argument("--hidden_size", type=int, default=512) # 一个词使用多长的向量来表示（词向量维数）
     parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
     parser.add_argument("--max_length", type=int, default=512)
