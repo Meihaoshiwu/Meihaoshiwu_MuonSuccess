@@ -12,6 +12,6 @@ setup(
         "tqdm",
     ],
     python_requires=">=3.8",
-    author="Your Name",
+    author="Sudetong",
     description="Muon Block Matrix Experiment",
 )

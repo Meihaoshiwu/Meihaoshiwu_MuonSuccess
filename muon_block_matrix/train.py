@@ -40,16 +40,10 @@ def count_parameters(model):
 
 def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048,
                             max_length=512, per_gpu_batch_size=32, rank=0, world_size=1):
-    """获取模型和DataLoader"""
-    
-    # 加载数据集
-    dataset = load_dataset(dataset_name)
-    
+    # token单独在另一个进程处理，解耦合
     # 创建 MoonDataset
     train_dataset = MoonDataset(
         dataset_name=dataset_name,
-        dataset=dataset,
-        tokenizer_name="Qwen/Qwen2.5-0.5B",
         max_length=max_length
     )
     
@@ -322,16 +316,15 @@ def train_worker(rank, world_size, experiment_config):
                     if avg_epoch_loss < experiment_config.loss_threshold:
                         stop_training = True
                         logger.info(f"🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
-            
-            # 同步停止决策
-            if rank != 0:
-                # 检查主进程已经达到停止条件
-                stop_training = broadcast_stop_signal(stop_training, rank)
+
+            # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
+            stop_training = broadcast_stop_signal(stop_training, rank)
             
             epoch += 1
         
         final_loss = losses[-1] if losses else float('inf')
-        logger.info(f"🏁 训练结束 - 总token数: {total_tokens_trained:,}, 最终损失: {final_loss:.4f}")
+        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training},rank={rank}"
+                    " final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss}")
         return final_loss, losses
 
 def run_experiment(experiment_config: ExperimentConfig):

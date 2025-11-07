@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.multiprocessing as mp
+
+from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import Qwen2Tokenizer
 from loguru import logger
@@ -8,32 +10,30 @@ from typing import List, Optional
 
 from .config import TOKENIZED_CACHE, MODEL_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
 
-def load_dataset(dataset_name: str):
+def load_dataset_by_name(dataset_name: str):
     """加载数据集函数"""
     name2path = {
         "openwebtext-100k": "Elriggs/openwebtext-100k",
         "openwebtext": "Skylion007/openwebtext",
         "wikitext-103": "wikitext",
         "openwebtext-local_txt": "text",
-        "openwebtext-100k-local_txt": "arrow",   # <-- 新增
+        "openwebtext-100k-local_txt": "arrow",
     }
     
     if dataset_name not in name2path:
         raise ValueError(f"Unknown dataset: {dataset_name}")
-    
-    from datasets import load_dataset as hf_load_dataset
 
     if dataset_name == "openwebtext-100k-local_txt":
         # 直接读本地 arrow 文件，**不走网络**
-        dataset = hf_load_dataset(
-            "arrow",                         # 内置格式加载器
+        dataset = load_dataset(
+            "arrow",
             data_files=f"{DATASET_CACHE}/Elriggs___openwebtext-100k/default/0.0.0/2b7bfd980d5227806de62ac735f40712a4881273/openwebtext-100k-train.arrow",
             split="train",
-            cache_dir=DATASET_CACHE,         # 可选，仍可复用缓存
+            cache_dir=DATASET_CACHE,
         )
 
     elif dataset_name == "openwebtext-local_txt":
-        dataset = hf_load_dataset(
+        dataset = load_dataset(
             "text",
             data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt",
             streaming=True,
@@ -44,7 +44,7 @@ def load_dataset(dataset_name: str):
     else:
         # 其余数据集走缓存/本地检查
         try:
-            dataset = hf_load_dataset(
+            dataset = load_dataset(
                 name2path[dataset_name],
                 cache_dir=DATASET_CACHE,
                 local_files_only=True
@@ -148,7 +148,7 @@ class ExperimentPreparer:
         """多进程处理"""
         partial_dir = f"{self.output_file}_partial"
         os.makedirs(partial_dir, exist_ok=True)
-
+        logger.info("Using multi-process tokenization start")
         # 1. 数据划分
         worker_data = self._distribute_data(self.texts, self.num_workers, self.batch_size)
         worker_inputs = [(wid, batches, self.tokenizer_name, self.cache_dir)
@@ -195,36 +195,26 @@ class MoonDataset(Dataset):
     def __init__(
         self,
         dataset_name: str,
-        dataset,  # datasets.DatasetDict
-        tokenizer_name: str = "Qwen/Qwen2.5-0.5B",
         max_length: int = 512,
     ):
         self.dataset_name = dataset_name
-        if "train" in dataset:
-            self.texts = dataset["train"]["text"]
-        else:
-            self.texts = dataset["text"]        # 本地 arrow 已带 split
         self.max_length = max_length
+        
+        # 直接加载预处理好的 tokenized 数据
         self.cache_file = os.path.join(TOKENIZED_CACHE, f"{dataset_name}.bin")
-        self.tokens = []
-        self._tokenize(tokenizer_name)
-
-    def _tokenize(self, tokenizer_name: str):
-        if os.path.exists(self.cache_file):
-            self.tokens = torch.load(self.cache_file, weights_only=True)
-            return
-        os.makedirs(TOKENIZED_CACHE, exist_ok=True)
-        preparer = ExperimentPreparer(
-            texts=self.texts,
-            tokenizer_name=tokenizer_name,
-            cache_dir=MODEL_CACHE,
-            output_file=self.cache_file,
-        )
-        self.tokens = preparer.tokenize()
+        if not os.path.exists(self.cache_file):
+            raise FileNotFoundError(
+                f"预处理文件不存在: {self.cache_file}\n"
+                f"请先运行: python -m muon_block_matrix.preprocess --dataset {dataset_name}"
+            )
+        
+        self.tokens = torch.load(self.cache_file, weights_only=True)
+        print(f"📁 加载预处理数据: {len(self.tokens)} tokens")
 
     def __len__(self):
         return len(self.tokens) // self.max_length
 
     def __getitem__(self, idx):
         start = idx * self.max_length
-        return torch.tensor(self.tokens[start : start + self.max_length], dtype=torch.long)
+        end = start + self.max_length
+        return torch.tensor(self.tokens[start:end], dtype=torch.long)
