@@ -1,10 +1,14 @@
-import torch
 import gc
+import time
+import threading
+
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
+
 from transformers import get_cosine_schedule_with_warmup
 from loguru import logger
 from datetime import datetime
@@ -21,8 +25,15 @@ def get_timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def setup_ddp(rank: int, world_size: int):
+    # 增加 NCCL 超时时间
+    import os
+    os.environ['NCCL_TIMEOUT'] = '1800'  # 30分钟超时
+    os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '1800'
+    
+    logger.info(f"Rank {rank}: 初始化进程组，超时时间1800秒")
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    logger.info(f"Rank {rank}: 进程组初始化完成")
 
 def cleanup_ddp():
     if dist.is_initialized():
@@ -41,6 +52,7 @@ def count_parameters(model):
 def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048,
                             max_length=512, per_gpu_batch_size=32, rank=0, world_size=1):
     # token单独在另一个进程处理，解耦合
+    logger.info(f"Rank {rank}: 创建MoonDataset")
     # 创建 MoonDataset
     train_dataset = MoonDataset(
         dataset_name=dataset_name,
@@ -48,35 +60,27 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
     )
     
     # DistributedSampler 工作原理：将数据均匀分配给多个GPU
-    # 在数据分配给各个进程之前进行全局打乱和划分。数据集只有一份，每个进程只是对索引进行打乱，没有数据集副本
-    # 每个epoch进程间通信，set_epoch 设置种子，保证各进程之间打乱出来的索引一致
-    # 根据rank每个进程取一部分索引，不重叠，拿着这些索引访问数据集
     sampler = DistributedSampler(train_dataset,
                                 num_replicas=world_size, # 总进程数
                                 rank=rank,  # 当前进程排名
                                 shuffle=True) if world_size > 1 else None # world_size大于1才使用sampler
     
-    # DataLoader 的工作流程：
-    # 1. 从磁盘读取原始数据（文本、图像等）
-    # 2. 数据预处理（分词、归一化、数据增强）
-    # 3. 组成 batch
-    # 4. 传输到 GPU
-    # 前3步都在 CPU 上执行，只有第4步涉及 GPU
-    num_workers = min(2, mp.cpu_count() // world_size)  # 每个GPU分到少量worker，本来已经做了数据并行的多进程
-    train_loader = DataLoader( # 只涉及给分配好的数据打包，不涉及分配数据到GPU
+    # DataLoader 配置优化
+    num_workers = min(2, mp.cpu_count() // world_size)
+    train_loader = DataLoader(
         train_dataset, 
         batch_size=per_gpu_batch_size, 
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers=num_workers,           # 使用多进程加载数据
-        pin_memory=True,                   # 将数据直接加载到 GPU 可快速访问的"锁页内存"
-        persistent_workers=(num_workers > 0),  # 保持worker进程，避免重复创建
-        prefetch_factor=2 if num_workers > 0 else None,  # 每个 worker 预先加载的 batch 数量
-        drop_last=True                     # 丢弃不完整的batch, 分布式训练中特别重要，确保所有 GPU 处理相同大小的 batch
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,  # 禁用持久化worker，避免状态累积
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=True,
+        timeout=30  # 添加30秒超时
     )
     
-    logger.info(f"DataLoader configured with {num_workers} workers, per_gpu_batch_size {per_gpu_batch_size}")
-    logger.info(f"Training with {world_size} GPU(s), rank {rank}")
+    logger.info(f"Rank {rank}: DataLoader配置完成 - {num_workers} workers, batch_size {per_gpu_batch_size}")
 
     # 创建模型
     model = create_qwen_model(
@@ -134,7 +138,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     else:
         sink_id = logger.add(
             f"{log_file_path}/{timestamp}_rank{rank}_{step_func_name}.log", 
-            mode="w", level="ERROR"
+            mode="w", level="INFO"  # 改为INFO级别以便调试
         )
     
     # 打印工作进程初始化成功日志
@@ -151,7 +155,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         hidden_size=experiment_config.hidden_size,
         max_position_embeddings=max_position_embeddings,
         max_length=max_length,
-        per_gpu_batch_size=batch_size//world_size, # 多进程将batch分给多个GPU
+        per_gpu_batch_size=batch_size//world_size,
         rank=rank,
         world_size=world_size
     )
@@ -223,8 +227,86 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
+class HangDetector:
+    """hang检测器"""
+    def __init__(self, rank, timeout=300):  # 5分钟超时
+        self.rank = rank
+        self.timeout = timeout
+        self.last_activity_time = time.time()
+        self.active_step = None
+        self.monitor_thread = None
+        self.enabled = True
+        
+    def start_monitoring(self):
+        """开始监控"""
+        if self.monitor_thread is None:
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            logger.info(f"Rank {self.rank}: Hang检测器已启动，超时时间 {self.timeout}秒")
+    
+    def update_activity(self, step_name):
+        """更新活动状态"""
+        self.last_activity_time = time.time()
+        self.active_step = step_name
+        logger.debug(f"Rank {self.rank}: 活动更新 - {step_name}")
+    
+    def _monitor_loop(self):
+        """监控循环"""
+        while self.enabled:
+            current_time = time.time()
+            idle_time = current_time - self.last_activity_time
+            
+            if idle_time > self.timeout:
+                logger.error(f"Rank {self.rank}: ❌ 检测到hang！当前步骤: {self.active_step}, "
+                           f"已空闲 {idle_time:.0f}秒 (超时: {self.timeout}秒)")
+                
+                # 输出详细诊断信息
+                self._dump_diagnostic_info()
+                
+                # 强制退出进程
+                os._exit(1)
+            
+            # 每分钟记录一次状态
+            if int(current_time) % 60 == 0:
+                logger.info(f"Rank {self.rank}: 监控状态 - 当前步骤: {self.active_step}, "
+                          f"空闲时间: {idle_time:.0f}秒")
+            
+            time.sleep(10)  # 每10秒检查一次
+    
+    def _dump_diagnostic_info(self):
+        """输出诊断信息"""
+        import traceback
+        import sys
+        
+        logger.error(f"Rank {self.rank}: === HANG诊断信息 ===")
+        logger.error(f"当前步骤: {self.active_step}")
+        logger.error(f"进程PID: {os.getpid()}")
+        logger.error(f"父进程PID: {os.getppid()}")
+        logger.error(f"活动线程数: {threading.active_count()}")
+        
+        # 输出所有线程的堆栈
+        for thread_id, stack in sys._current_frames().items():
+            logger.error(f"线程 {thread_id} 堆栈:")
+            for filename, lineno, name, line in traceback.extract_stack(stack):
+                logger.error(f"  {filename}:{lineno} in {name}")
+        
+        # 输出GPU内存信息
+        if torch.cuda.is_available():
+            try:
+                gpu_memory = torch.cuda.memory_allocated() / 1024**3
+                logger.error(f"GPU内存使用: {gpu_memory:.2f} GB")
+            except:
+                logger.error("无法获取GPU内存信息")
+        
+        logger.error(f"Rank {self.rank}: === 诊断信息结束 ===")
+
+# 在训练进程中添加hang检测
 def train_worker(rank, world_size, experiment_config):
     """DDP训练工作进程"""
+    # 创建hang检测器
+    hang_detector = HangDetector(rank, timeout=300)  # 5分钟超时
+    hang_detector.start_monitoring()
+    
     with experiment_manager(experiment_config, rank, world_size) as resources:
         model = resources.model
         train_loader = resources.train_loader
@@ -237,26 +319,34 @@ def train_worker(rank, world_size, experiment_config):
         model.train()
         losses = []
         total_tokens_trained = 0
-        batch_size = experiment_config.batch_size # 这是全量的batch大小
+        batch_size = experiment_config.batch_size
         max_length = experiment_config.max_length
         max_tokens = experiment_config.max_tokens
         
         # 计算每个batch的token数
         tokens_per_batch = batch_size * max_length
-        
+        tokens_per_epoch = len(train_loader) * tokens_per_batch
         epoch = 0
         stop_training = False
         
         # 外层循环改为基于epoch，内层检查token数
         while epoch < experiment_config.max_epochs and not stop_training:
+            logger.info(f"Rank {rank}: 开始Epoch {epoch}")
+            hang_detector.update_activity(f"Epoch {epoch} 开始")
+            
             if sampler:
                 sampler.set_epoch(epoch)
                 
             epoch_losses = []
             
+            # 添加跳过批次计数器
+            skipped_batches = 0
+            total_batches = len(train_loader)
+            skip_threshold = total_batches * 0.05  # 5%阈值
+            
             if rank == 0:
                 epoch_pbar = tqdm(
-                    total=max_tokens,
+                    total=tokens_per_epoch,
                     desc=f"Epoch {epoch+1}",
                     unit="tokens",
                     ncols=100,
@@ -265,66 +355,110 @@ def train_worker(rank, world_size, experiment_config):
                 )
             
             for step, batch in enumerate(train_loader):
+                hang_detector.update_activity(f"Epoch {epoch} Step {step} - 获取batch")
+                
+                # 检查跳过批次是否超过阈值
+                if skipped_batches > skip_threshold:
+                    logger.error(f"Rank {rank}: ❌ 跳过批次过多 ({skipped_batches}/{total_batches}, {skipped_batches/total_batches*100:.1f}%)，停止训练")
+                    stop_training = True
+                    break
+                    
                 # 检查是否达到token限制
                 if total_tokens_trained >= max_tokens:
-                    logger.info(f"🎯 已达到目标token数 {max_tokens}, 停止训练")
+                    logger.info(f"Rank {rank}: 🎯 已达到目标token数 {max_tokens}, 停止训练")
                     stop_training = True
                     break
                 
-                optimizer.zero_grad()
-                batch = batch.to(device)
-                input_ids = batch
-                outputs = model(input_ids=input_ids, labels=input_ids)
-                loss = outputs.loss
-                
-                loss.backward()
-                optimizer.step()
-                lr_scheduler.step()
-                
-                current_loss = loss.item()
-                epoch_losses.append(current_loss)
-                
-                # 更新token计数
-                total_tokens_trained += tokens_per_batch
-                
-                if rank == 0:
-                    epoch_pbar.set_postfix({
-                        'loss': f'{current_loss:.4f}',
-                        'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
-                        'lr': f'{optimizer.param_groups[0]["lr"]:.5e}'
-                    })
-                    epoch_pbar.update(tokens_per_batch)
+                try:
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器清零")
+                    optimizer.zero_grad()
                     
-                if step % 100 == 0:
-                    progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
-                    logger.info(
-                        f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
-                        f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"Loss: {current_loss:.4f}"
-                    )
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 数据转移到GPU")
+                    batch = batch.to(device)
+                    input_ids = batch
+                    
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 前向传播")
+                    logger.debug(f"Rank {rank}: Epoch {epoch} Step {step} 开始前向传播")
+                    outputs = model(input_ids=input_ids, labels=input_ids)
+                    loss = outputs.loss
+                    
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 反向传播")
+                    loss.backward()
+                    
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器步骤")
+                    optimizer.step()
+                    
+                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 学习率调度")
+                    lr_scheduler.step()
+                    
+                    current_loss = loss.item()
+                    epoch_losses.append(current_loss)
+                    
+                    # 更新token计数
+                    total_tokens_trained += tokens_per_batch
+                    
+                    if rank == 0:
+                        epoch_pbar.set_postfix({
+                            'loss': f'{current_loss:.4f}',
+                            'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
+                            'lr': f'{optimizer.param_groups[0]["lr"]:.5e}',
+                            'skipped': f'{skipped_batches}'  # 显示跳过的批次数
+                        })
+                        epoch_pbar.update(tokens_per_batch)
+                        
+                    if step % 100 == 0:
+                        progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
+                        skip_pct = skipped_batches / (step + 1) * 100 if step > 0 else 0
+                        logger.info(
+                            f"Rank {rank}: StepFunc: {step_func_name} Epoch: {epoch} Step: {step} "
+                            f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
+                            f"Loss: {current_loss:.4f} Skipped: {skipped_batches} ({skip_pct:.1f}%)"
+                        )
+                        
+                except RuntimeError as e:
+                    if "DataLoader" in str(e) or "timeout" in str(e).lower():
+                        skipped_batches += 1
+                        skip_pct = skipped_batches / (step + 1) * 100
+                        logger.warning(f"Rank {rank}: DataLoader超时，跳过step {step}, 已跳过 {skipped_batches} 批次 ({skip_pct:.1f}%)")
+                        
+                        # 检查是否接近阈值
+                        if skipped_batches > skip_threshold * 0.8:  # 达到阈值的80%时警告
+                            logger.warning(f"Rank {rank}: ⚠️ 跳过批次接近阈值 ({skipped_batches}/{skip_threshold:.0f})")
+                            
+                        continue  # 跳过当前batch，继续下一个
+                    else:
+                        raise  # 重新抛出其他异常
             
             if rank == 0:
                 epoch_pbar.close()
                 
                 # 计算epoch平均损失
-                if epoch_losses:  # 避免除零
+                if epoch_losses:
                     avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
                     losses.append(avg_epoch_loss)
-                    logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}")
+                    final_skip_pct = skipped_batches / total_batches * 100 if total_batches > 0 else 0
+                    logger.info(f"Rank {rank}: 📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 跳过批次: {skipped_batches}/{total_batches} ({final_skip_pct:.1f}%)")
                     
                     # 保留loss阈值检查作为备选停止条件
                     if avg_epoch_loss < experiment_config.loss_threshold:
                         stop_training = True
-                        logger.info(f"🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
+                        logger.info(f"Rank {rank}: 🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
 
-            # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
+            # 同步停止信号
+            logger.debug(f"Rank {rank}: 同步停止信号, 当前stop_training={stop_training}")
+            hang_detector.update_activity("同步停止信号")
             stop_training = broadcast_stop_signal(stop_training, rank)
+            logger.info(f"Rank {rank}: Epoch {epoch} 完成, 累计token: {total_tokens_trained}")
             
             epoch += 1
         
+        # 停止hang检测器
+        hang_detector.enabled = False
+        
         final_loss = losses[-1] if losses else float('inf')
-        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training},rank={rank}"
-                    " final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss}")
+        avg_epoch_loss = losses[-1] if losses else float('inf')
+        logger.info(f"Rank {rank}: 训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, "
+                   f"final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss:.4f}")
         return final_loss, losses
 
 def run_experiment(experiment_config: ExperimentConfig):

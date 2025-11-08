@@ -22,9 +22,9 @@ def main():
     parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
     parser.add_argument("--max_length", type=int, default=512)
     # 每个样本有多少个token（即词向量）这决定了局部连续文本长度，影响学习效率，如果文本太短很难学习到词语之间联系
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--loss_threshold", type=float, default=0.1)
-    parser.add_argument("--max_epochs", type=int, default=100)
+    parser.add_argument("--max_epochs", type=int, default=1000)
     parser.add_argument("--max_tokens", type=int, default=10000000000, help="最大训练token数量")
     args = parser.parse_args()
 
