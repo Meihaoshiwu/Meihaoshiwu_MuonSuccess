@@ -1,5 +1,8 @@
 import os
 
+import traceback
+from datetime import datetime
+
 # === 自定义存储路径 ===
 MUON_BLOCK_MATRIX_EXPERIMENT_DIR = os.getenv("MUON_BLOCK_MATRIX_EXPERIMENT_DIR")
 # === 基于环境变量的存储路径 ===
@@ -10,6 +13,29 @@ RESULTS_BASE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Results")
 OPENWEBTEXT_EXTRACTED = os.path.join(DATASET_PATH, "openwebtext_extracted")
 DATASET_CACHE = os.path.join(DATASET_PATH, "cache")
 DATASET_DOWNLOAD = os.path.join(DATASET_PATH, "download")
+
+def log_diagnostic(module_name, message=""):
+    """简单的诊断日志函数"""
+    pid = os.getpid()
+    ppid = os.getppid()
+    
+    # 创建诊断日志目录
+    log_dir = f"{RESULTS_BASE}/muon_diagnostics"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # 每个进程有自己的日志文件
+    log_file = f"{log_dir}/process_{pid}.log"
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] PID:{pid} PPID:{ppid} | {module_name} | {message}\n")
+        
+        # 记录调用栈
+        stack = traceback.extract_stack()
+        for _, frame in enumerate(stack[:-2]):  # 排除诊断函数本身
+            f.write(f"    {frame.filename}:{frame.lineno} in {frame.name}\n")
+        f.write("\n")
 
 # 原始常量
 DEFAULT_MAX_LENGTH = 512
@@ -38,6 +64,7 @@ class ExperimentConfig():
         wd=DEFAULT_WD, #AdamW使用
         sampler=None,
         max_tokens=None,  # 新增：最大token数量
+        block_num=4,      # 控制分快数量
         ):
         self.step_func_name = step_func_name
         self.step_func=step_func
@@ -55,6 +82,7 @@ class ExperimentConfig():
         self.wd = wd
         self.sampler = sampler
         self.max_tokens = max_tokens or float('inf')  # 默认无限制
+        self.block_num = block_num
     
     def __repr__(self):
         return (f"ExperimentConfig(step_func_name={self.step_func_name}, "

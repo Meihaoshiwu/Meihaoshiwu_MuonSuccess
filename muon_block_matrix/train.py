@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from .config import *
 from .model import create_qwen_model
-from .data import MoonDataset, load_dataset
+from .data import MoonDataset
 from .optimizer import get_optimizer, STEP_MAP
 
 # -------------- 工具函数 --------------

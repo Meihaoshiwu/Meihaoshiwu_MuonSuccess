@@ -6,7 +6,7 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import Qwen2Tokenizer
 from loguru import logger
-from typing import List, Optional
+from typing import List
 
 from .config import TOKENIZED_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
 
