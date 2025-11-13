@@ -3,7 +3,7 @@ import os
 from loguru import logger
 
 # 诊断导入
-from .diagnostics import log_diagnostic
+from .config import log_diagnostic
 log_diagnostic("main.py", "模块开始导入")
 
 from .config import *

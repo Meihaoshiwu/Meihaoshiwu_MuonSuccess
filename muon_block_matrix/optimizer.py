@@ -1,5 +1,6 @@
 import math
 import torch
+from loguru import logger
 
 # ---- 牛顿-舒尔茨正交化 ----
 @torch.compile
@@ -18,7 +19,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int):
         X = X.T
     return X
 
-def step_default(G, steps):
+def step_default(G, steps, block_num): # block_num无效变量，只是为了和其他钩子保持一致
     return zeropower_via_newtonschulz5(G, steps)
 
 def process_block(blocked_matrix, steps):
@@ -28,68 +29,101 @@ def process_block(blocked_matrix, steps):
     else:
         return blocked_matrix
 
-def step_column_block(G, steps):
+def step_column_block(G, steps, block_num: int):
     """
-    将矩阵的列分成4块，每块独立进行正交化处理
+    将矩阵的列分成column_num块，每块独立进行正交化处理
     """
     result = torch.zeros_like(G) # 用于保存结果
     cols = G.shape[1]  # 总列数
-    block_size = cols // 4  # 每块的列数
     
-    # 处理前3个完整的块
-    for i in range(3):
+    # 检查是否支持这么多分块
+    if block_num > cols:
+        logger.info(f"Warning: 矩阵只有{cols}列，但要求分成{block_num}块，将作为整体处理")
+        return process_block(G, steps)
+    
+    block_size = cols // block_num  # 每块的列数
+
+    for i in range(block_num-1):
         start_col = i * block_size
         end_col = (i + 1) * block_size
         column_block = G[:, start_col:end_col] # 取所有行，[start_col,end_col)列
-
         result[:, start_col:end_col] = process_block(column_block, steps)
     
     # 处理最后一块（可能包含剩余的列）
-    start_col = 3 * block_size
+    start_col = (block_num-1) * block_size
     last_block = G[:, start_col:]
     result[:, start_col:] = process_block(last_block, steps)
     
     return result
 
-def step_row_block(G, steps):
+def step_row_block(G, steps, block_num: int):
     """
-    将矩阵的行分成4块，每块独立进行正交化处理
+    将矩阵的行分成row_num块，每块独立进行正交化处理
     """
     result = torch.zeros_like(G)
     rows = G.shape[0]  # 总行数
-    block_size = rows // 4  # 每块的行数
     
-    # 处理前3个完整的块
-    for i in range(3):
+    # 检查是否支持这么多分块
+    if block_num > rows:
+        logger.info(f"Warning: 矩阵只有{rows}行，但要求分成{block_num}块，将作为整体处理")
+        return process_block(G, steps)
+    
+    block_size = rows // block_num  # 每块的行数
+    
+    # 处理前row_num-1个完整的块
+    for i in range(block_num-1):
         start_row = i * block_size
         end_row = (i + 1) * block_size
         row_block = G[start_row:end_row, :]
         result[start_row:end_row, :] = process_block(row_block, steps)
     
     # 处理最后一块（可能包含剩余的行）
-    start_row = 3 * block_size
+    start_row = (block_num-1) * block_size
     last_block = G[start_row:, :]
     result[start_row:, :] = process_block(last_block, steps)
     
     return result
 
-def step_quadrant_block(G, steps):
+def step_block_matrix_flexible(G, steps, block_num):
     """
-    将矩阵分成2x2的分成四块
+    更灵活的分块函数，可以处理非平方数的分块数
+    例如：block_num=12 -> 可能会分成3x4或4x3等
     """
     result = torch.zeros_like(G)
+    rows, cols = G.shape
     
-    rowidx = G.shape[0]//2
-    colidx = G.shape[1]//2
+    # 寻找最接近平方根的两个因数
+    row_blocks, col_blocks = -1, -1
+    sqrt_block = int(math.sqrt(block_num))
+    for i in range(sqrt_block, 1, -1): # 至少不退化到列分块
+        if block_num % i == 0:
+            row_blocks, col_blocks = i, block_num // i
+            break
+    
+    if row_blocks < 0:
+        logger.info(f"Warning: 无法将{block_num}分解为合适的因数，将作为整体处理")
+        return process_block(G, steps)
 
-    G11 = G[:rowidx, :colidx]
-    result[:rowidx, :colidx] = process_block(G11, steps)
-    G12 = G[:rowidx, colidx:]
-    result[:rowidx, colidx:] = process_block(G12, steps)
-    G21 = G[rowidx:, :colidx]
-    result[rowidx:, :colidx] = process_block(G21, steps)
-    G22 = G[rowidx:, colidx:]
-    result[rowidx:, colidx:] = process_block(G22, steps)
+    if rows // row_blocks < 1 or cols // col_blocks < 1:
+        logger.info(f"Warning: 分块后某些块没有元素，将作为整体处理")
+        return process_block(G, steps)
+    
+    row_block_size = rows // row_blocks
+    col_block_size = cols // col_blocks
+    
+    for i in range(row_blocks):
+        for j in range(col_blocks):
+            # 计算当前块的行范围
+            start_row = i * row_block_size
+            end_row = (i + 1) * row_block_size if i < row_blocks - 1 else rows
+            
+            # 计算当前块的列范围
+            start_col = j * col_block_size
+            end_col = (j + 1) * col_block_size if j < col_blocks - 1 else cols
+            
+            # 处理当前块
+            block = G[start_row:end_row, start_col:end_col]
+            result[start_row:end_row, start_col:end_col] = process_block(block, steps)
     
     return result
 
@@ -98,7 +132,7 @@ STEP_MAP = {
     "step_func_default": {"loss_threshold": 1.0, "step_func": step_default},
     "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
     "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
-    "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_quadrant_block}
+    "step_func_block_matrix": {"loss_threshold": 1.0, "step_func": step_block_matrix_flexible}
 }
 
 class Muon(torch.optim.Optimizer):
@@ -140,6 +174,7 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.9, 0.95),
         adamw_eps=1e-8,
+        block_num=4
     ):
 
         defaults = dict(
@@ -153,6 +188,7 @@ class Muon(torch.optim.Optimizer):
         )
 
         self.step_func = step_func
+        self.block_num = block_num
         params = list(muon_params)
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params.extend(adamw_params)
@@ -218,7 +254,7 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = self.step_func(g, steps=group["ns_steps"])
+                u = self.step_func(g, steps=group["ns_steps"], block_num=self.block_num)
 
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
@@ -265,7 +301,7 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-def get_optimizer(step_func:callable, optimizer_name, model, lr=1e-3, wd=0.1):
+def get_optimizer(step_func:callable, optimizer_name, model, lr=1e-3, wd=0.1, block_num=4):
     if optimizer_name == "adamw":
         return torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95)
@@ -290,6 +326,7 @@ def get_optimizer(step_func:callable, optimizer_name, model, lr=1e-3, wd=0.1):
             wd=wd,
             muon_params=muon_params,
             adamw_params=adamw_params,
+            block_num=block_num,
         )
     else:
         assert 0, "optimizer not supported"

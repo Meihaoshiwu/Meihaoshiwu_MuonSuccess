@@ -182,7 +182,8 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         optimizer_name=optimizer_name, 
         model=original_model,
         lr=lr, 
-        wd=experiment_config.wd
+        wd=experiment_config.wd,
+        block_num=experiment_config.block_num,
     )
     
     num_training_steps = len(train_loader) * max_epochs
