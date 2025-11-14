@@ -228,85 +228,85 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
-class HangDetector:
-    """hang检测器"""
-    def __init__(self, rank, timeout=300):  # 5分钟超时
-        self.rank = rank
-        self.timeout = timeout
-        self.last_activity_time = time.time()
-        self.active_step = None
-        self.monitor_thread = None
-        self.enabled = True
+# class HangDetector:
+#     """hang检测器"""
+#     def __init__(self, rank, timeout=300):  # 5分钟超时
+#         self.rank = rank
+#         self.timeout = timeout
+#         self.last_activity_time = time.time()
+#         self.active_step = None
+#         self.monitor_thread = None
+#         self.enabled = True
         
-    def start_monitoring(self):
-        """开始监控"""
-        if self.monitor_thread is None:
-            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self.monitor_thread.start()
-            logger.info(f"Rank {self.rank}: Hang检测器已启动，超时时间 {self.timeout}秒")
+#     def start_monitoring(self):
+#         """开始监控"""
+#         if self.monitor_thread is None:
+#             self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+#             self.monitor_thread.start()
+#             logger.info(f"Rank {self.rank}: Hang检测器已启动，超时时间 {self.timeout}秒")
     
-    def update_activity(self, step_name):
-        """更新活动状态"""
-        self.last_activity_time = time.time()
-        self.active_step = step_name
-        logger.debug(f"Rank {self.rank}: 活动更新 - {step_name}")
+#     def update_activity(self, step_name):
+#         """更新活动状态"""
+#         self.last_activity_time = time.time()
+#         self.active_step = step_name
+#         logger.debug(f"Rank {self.rank}: 活动更新 - {step_name}")
     
-    def _monitor_loop(self):
-        """监控循环"""
-        while self.enabled:
-            current_time = time.time()
-            idle_time = current_time - self.last_activity_time
+#     def _monitor_loop(self):
+#         """监控循环"""
+#         while self.enabled:
+#             current_time = time.time()
+#             idle_time = current_time - self.last_activity_time
             
-            if idle_time > self.timeout:
-                logger.error(f"Rank {self.rank}: ❌ 检测到hang！当前步骤: {self.active_step}, "
-                           f"已空闲 {idle_time:.0f}秒 (超时: {self.timeout}秒)")
+#             if idle_time > self.timeout:
+#                 logger.error(f"Rank {self.rank}: ❌ 检测到hang！当前步骤: {self.active_step}, "
+#                            f"已空闲 {idle_time:.0f}秒 (超时: {self.timeout}秒)")
                 
-                # 输出详细诊断信息
-                self._dump_diagnostic_info()
+#                 # 输出详细诊断信息
+#                 self._dump_diagnostic_info()
                 
-                # 强制退出进程
-                os._exit(1)
+#                 # 强制退出进程
+#                 os._exit(1)
             
-            # 每分钟记录一次状态
-            if int(current_time) % 60 == 0:
-                logger.info(f"Rank {self.rank}: 监控状态 - 当前步骤: {self.active_step}, "
-                          f"空闲时间: {idle_time:.0f}秒")
+#             # 每分钟记录一次状态
+#             if int(current_time) % 60 == 0:
+#                 logger.info(f"Rank {self.rank}: 监控状态 - 当前步骤: {self.active_step}, "
+#                           f"空闲时间: {idle_time:.0f}秒")
             
-            time.sleep(10)  # 每10秒检查一次
+#             time.sleep(10)  # 每10秒检查一次
     
-    def _dump_diagnostic_info(self):
-        """输出诊断信息"""
-        import traceback
-        import sys
+#     def _dump_diagnostic_info(self):
+#         """输出诊断信息"""
+#         import traceback
+#         import sys
         
-        logger.error(f"Rank {self.rank}: === HANG诊断信息 ===")
-        logger.error(f"当前步骤: {self.active_step}")
-        logger.error(f"进程PID: {os.getpid()}")
-        logger.error(f"父进程PID: {os.getppid()}")
-        logger.error(f"活动线程数: {threading.active_count()}")
+#         logger.error(f"Rank {self.rank}: === HANG诊断信息 ===")
+#         logger.error(f"当前步骤: {self.active_step}")
+#         logger.error(f"进程PID: {os.getpid()}")
+#         logger.error(f"父进程PID: {os.getppid()}")
+#         logger.error(f"活动线程数: {threading.active_count()}")
         
-        # 输出所有线程的堆栈
-        for thread_id, stack in sys._current_frames().items():
-            logger.error(f"线程 {thread_id} 堆栈:")
-            for filename, lineno, name, line in traceback.extract_stack(stack):
-                logger.error(f"  {filename}:{lineno} in {name}")
+#         # 输出所有线程的堆栈
+#         for thread_id, stack in sys._current_frames().items():
+#             logger.error(f"线程 {thread_id} 堆栈:")
+#             for filename, lineno, name, line in traceback.extract_stack(stack):
+#                 logger.error(f"  {filename}:{lineno} in {name}")
         
-        # 输出GPU内存信息
-        if torch.cuda.is_available():
-            try:
-                gpu_memory = torch.cuda.memory_allocated() / 1024**3
-                logger.error(f"GPU内存使用: {gpu_memory:.2f} GB")
-            except:
-                logger.error("无法获取GPU内存信息")
+#         # 输出GPU内存信息
+#         if torch.cuda.is_available():
+#             try:
+#                 gpu_memory = torch.cuda.memory_allocated() / 1024**3
+#                 logger.error(f"GPU内存使用: {gpu_memory:.2f} GB")
+#             except:
+#                 logger.error("无法获取GPU内存信息")
         
-        logger.error(f"Rank {self.rank}: === 诊断信息结束 ===")
+#         logger.error(f"Rank {self.rank}: === 诊断信息结束 ===")
 
-# 在训练进程中添加hang检测
+# hang检测版本，目前来看之前的通信问题只是因为bash断联，发的SIGHUP。改用tmux之后没有这个问题
 def train_worker(rank, world_size, experiment_config):
     """DDP训练工作进程"""
     # 创建hang检测器
-    hang_detector = HangDetector(rank, timeout=300)  # 5分钟超时
-    hang_detector.start_monitoring()
+    # hang_detector = HangDetector(rank, timeout=300)  # 5分钟超时
+    # hang_detector.start_monitoring()
     
     with experiment_manager(experiment_config, rank, world_size) as resources:
         model = resources.model
@@ -330,10 +330,18 @@ def train_worker(rank, world_size, experiment_config):
         epoch = 0
         stop_training = False
         
+        # === 吞吐量统计变量 ===
+        if rank == 0:
+            train_start_time = time.time()
+            last_step_time = train_start_time
+            step_count_since_last = 0
+            tokens_since_last = 0
+        # ==========================
+        
         # 外层循环改为基于epoch，内层检查token数
         while epoch < experiment_config.max_epochs and not stop_training:
             logger.info(f"Rank {rank}: 开始Epoch {epoch}")
-            hang_detector.update_activity(f"Epoch {epoch} 开始")
+            #hang_detector.update_activity(f"Epoch {epoch} 开始")
             
             if sampler:
                 sampler.set_epoch(epoch)
@@ -356,7 +364,7 @@ def train_worker(rank, world_size, experiment_config):
                 )
             
             for step, batch in enumerate(train_loader):
-                hang_detector.update_activity(f"Epoch {epoch} Step {step} - 获取batch")
+                #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 获取batch")
                 
                 # 检查跳过批次是否超过阈值
                 if skipped_batches > skip_threshold:
@@ -371,25 +379,25 @@ def train_worker(rank, world_size, experiment_config):
                     break
                 
                 try:
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器清零")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器清零")
                     optimizer.zero_grad()
                     
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 数据转移到GPU")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 数据转移到GPU")
                     batch = batch.to(device)
                     input_ids = batch
                     
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 前向传播")
-                    logger.debug(f"Rank {rank}: Epoch {epoch} Step {step} 开始前向传播")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 前向传播")
+                    #logger.debug(f"Rank {rank}: Epoch {epoch} Step {step} 开始前向传播")
                     outputs = model(input_ids=input_ids, labels=input_ids)
                     loss = outputs.loss
                     
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 反向传播")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 反向传播")
                     loss.backward()
                     
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器步骤")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器步骤")
                     optimizer.step()
                     
-                    hang_detector.update_activity(f"Epoch {epoch} Step {step} - 学习率调度")
+                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 学习率调度")
                     lr_scheduler.step()
                     
                     current_loss = loss.item()
@@ -398,22 +406,43 @@ def train_worker(rank, world_size, experiment_config):
                     # 更新token计数
                     total_tokens_trained += tokens_per_batch
                     
+                    # === 新增：吞吐量统计 ===
                     if rank == 0:
-                        epoch_pbar.set_postfix({
-                            'loss': f'{current_loss:.4f}',
-                            'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
-                            'lr': f'{optimizer.param_groups[0]["lr"]:.5e}',
-                            'skipped': f'{skipped_batches}'  # 显示跳过的批次数
-                        })
-                        epoch_pbar.update(tokens_per_batch)
+                        step_count_since_last += 1
+                        tokens_since_last += tokens_per_batch
+                    # ======================
                         
-                    if step % 100 == 0:
+                    if step % 1000 == 0:
                         progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
                         skip_pct = skipped_batches / (step + 1) * 100 if step > 0 else 0
+                        
+                        # === 每1000步计算吞吐量 ===
+                        throughput_info = ""
+                        if rank == 0:
+                            current_time = time.time()
+                            time_elapsed = current_time - last_step_time
+                            if time_elapsed > 0:
+                                tokens_per_sec = tokens_since_last / time_elapsed
+                                throughput_info = f" Throughput: {tokens_per_sec:.0f} tokens/sec"
+                                
+                                # 重置统计
+                                last_step_time = current_time
+                                step_count_since_last = 0
+                                tokens_since_last = 0
+                            # 更新进度条
+                            epoch_pbar.set_postfix({
+                                'loss': f'{current_loss:.4f}',
+                                'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
+                                'lr': f'{optimizer.param_groups[0]["lr"]:.5e}',
+                                'skipped': f'{skipped_batches}'  # 显示跳过的批次数
+                            })
+                            epoch_pbar.update(tokens_per_batch)
+                        
                         logger.info(
-                            f"Rank {rank}: StepFunc: {step_func_name} Epoch: {epoch} Step: {step} "
-                            f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                            f"Loss: {current_loss:.4f} Skipped: {skipped_batches} ({skip_pct:.1f}%)"
+                            f"Rank {rank}: StepFunc: {step_func_name} Epoch: {epoch} Step: {step}, "
+                            f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%), {throughput_info}"
+                            f"Loss: {current_loss:.4f} Skipped: {skipped_batches} ({skip_pct:.1f}%),"
+                            f"lr: {optimizer.param_groups[0]["lr"]:.5e}"
                         )
                         
                 except RuntimeError as e:
@@ -438,7 +467,8 @@ def train_worker(rank, world_size, experiment_config):
                     avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
                     losses.append(avg_epoch_loss)
                     final_skip_pct = skipped_batches / total_batches * 100 if total_batches > 0 else 0
-                    logger.info(f"Rank {rank}: 📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 跳过批次: {skipped_batches}/{total_batches} ({final_skip_pct:.1f}%)")
+                    logger.info(f"Rank {rank}: 📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f},"
+                                f" 跳过批次: {skipped_batches}/{total_batches} ({final_skip_pct:.1f}%)")
                     
                     # 保留loss阈值检查作为备选停止条件
                     if avg_epoch_loss < experiment_config.loss_threshold:
@@ -446,20 +476,29 @@ def train_worker(rank, world_size, experiment_config):
                         logger.info(f"Rank {rank}: 🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
 
             # 同步停止信号
-            logger.debug(f"Rank {rank}: 同步停止信号, 当前stop_training={stop_training}")
-            hang_detector.update_activity("同步停止信号")
+            #logger.debug(f"Rank {rank}: 同步停止信号, 当前stop_training={stop_training}")
+            #hang_detector.update_activity("同步停止信号")
             stop_training = broadcast_stop_signal(stop_training, rank)
             logger.info(f"Rank {rank}: Epoch {epoch} 完成, 累计token: {total_tokens_trained}")
             
             epoch += 1
         
         # 停止hang检测器
-        hang_detector.enabled = False
+        #hang_detector.enabled = False
+        
+        # === 训练结束时的总吞吐量统计 ===
+        final_throughput_info = ""
+        if rank == 0:
+            train_end_time = time.time()
+            total_train_time = train_end_time - train_start_time
+            if total_train_time > 0:
+                overall_throughput = total_tokens_trained / total_train_time
+                final_throughput_info = f" 总吞吐量: {overall_throughput:.0f} tokens/sec (总时间: {total_train_time:.1f}秒)"
         
         final_loss = losses[-1] if losses else float('inf')
         avg_epoch_loss = losses[-1] if losses else float('inf')
         logger.info(f"Rank {rank}: 训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, "
-                   f"final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss:.4f}")
+                   f"final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss:.4f}, {final_throughput_info}")
         return final_loss, losses
 
 def run_experiment(experiment_config: ExperimentConfig):

@@ -2,6 +2,8 @@ import math
 import torch
 from loguru import logger
 
+import os
+os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'  # 限制编译线程数量，避免编译线程抢占太多资源影响进程通信
 # ---- 牛顿-舒尔茨正交化 ----
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int):
