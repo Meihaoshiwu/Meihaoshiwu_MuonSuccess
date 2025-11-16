@@ -1,6 +1,6 @@
 import gc
 import time
-import threading
+from abc import ABC, abstractmethod
 
 import torch
 import torch.distributed as dist
@@ -17,8 +17,9 @@ from tqdm import tqdm
 
 from .config import *
 from .model import create_qwen_model
-from .data import MoonDataset
+from .data import StreamingMoonDataset, MoonDataset, start_data_loaders, stop_data_loaders, load_dataset_from_files
 from .optimizer import get_optimizer, STEP_MAP
+from .share_mem_manager import SharedMemoryCreator, SharedBufferManager, StreamConfig
 
 # -------------- 工具函数 --------------
 def get_timestamp():
@@ -39,7 +40,7 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def broadcast_stop_signal(stop_training: bool, rank: int) -> bool:
+def broadcast_stop_signal(stop_training:bool, rank: int) -> bool:
     if not dist.is_initialized():
         return stop_training
     t = torch.tensor([stop_training], dtype=torch.float32, device=f"cuda:{rank}")
@@ -49,14 +50,13 @@ def broadcast_stop_signal(stop_training: bool, rank: int) -> bool:
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
-def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048,
-                            max_length=512, per_gpu_batch_size=32, rank=0, world_size=1):
+def get_dataloader_standard(experiment_config: ExperimentConfig, rank=0, world_size=1):
     # token单独在另一个进程处理，解耦合
     logger.info(f"Rank {rank}: 创建MoonDataset")
     # 创建 MoonDataset
     train_dataset = MoonDataset(
-        dataset_name=dataset_name,
-        max_length=max_length
+        dataset_name=experiment_config.dataset_name,
+        max_length=experiment_config.max_length
     )
     
     # DistributedSampler 工作原理：将数据均匀分配给多个GPU
@@ -67,6 +67,7 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
     
     # DataLoader 配置优化
     num_workers = min(2, mp.cpu_count() // world_size)
+    per_gpu_batch_size = experiment_config.batch_size // world_size
     train_loader = DataLoader(
         train_dataset, 
         batch_size=per_gpu_batch_size, 
@@ -81,39 +82,135 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
     )
     
     logger.info(f"Rank {rank}: DataLoader配置完成 - {num_workers} workers, batch_size {per_gpu_batch_size}")
-
-    # 创建模型
-    model = create_qwen_model(
-        model_name=model_name,
-        hidden_size=hidden_size,
-        max_position_embeddings=max_position_embeddings
-    )
         
-    return model, train_loader, sampler
+    return train_loader, sampler
 
-class ExperimentResources:
-    """实验资源容器"""
+def get_dataloader_streaming(experiment_config: ExperimentConfig, stream_config: StreamConfig, rank=0, world_size=1):
+    """创建模型和流式数据加载器"""
+    
+    logger.info(f"Rank {rank}: 创建流式数据加载系统")
+    
+    # 创建共享缓冲区管理器（所有进程共享）
+    buffer_manager = SharedBufferManager(stream_config) # 使用主进程创建共享内存阶段的配置不能变
+    
+    # 创建流式数据集
+    stream_dataloader = StreamingMoonDataset(
+        buffer_manager=buffer_manager,
+        rank=rank,
+        world_size=world_size
+    )
+    
+    logger.info(f"Rank {rank}: 流式数据加载系统配置完成")
+        
+    return stream_dataloader
+
+class BaseExperimentResources(ABC):
+    """基础实验资源容器（抽象基类）"""
     def __init__(
-            self,
-            model,
-            train_loader,
-            optimizer,
-            device,
-            lr_scheduler,
-            sampler=None,
-            rank=0,
-            world_size=1):
+        self,
+        model,
+        optimizer,
+        device,
+        lr_scheduler,
+        rank=0,
+        world_size=1
+    ):
         self.model = model
-        self.train_loader = train_loader
         self.optimizer = optimizer
         self.device = device
         self.lr_scheduler = lr_scheduler
-        self.sampler = sampler
         self.rank = rank
         self.world_size = world_size
+    
+    @abstractmethod
+    def cleanup(self):
+        """清理资源（抽象方法）"""
+        pass
+
+class StreamingExperimentResources(BaseExperimentResources):
+    """流式训练资源容器"""
+    def __init__(
+        self,
+        model,
+        optimizer,
+        device,
+        lr_scheduler,
+        streaming_dataloader,
+        rank=0,
+        world_size=1
+    ):
+        super().__init__(model, optimizer, device, lr_scheduler, rank, world_size)
+        self.streaming_dataloader = streaming_dataloader
+    
+    def cleanup(self):
+        """流式训练特有的清理逻辑"""
+        self.streaming_dataloader.buffer_manager.close()
+
+class StandardExperimentResources(BaseExperimentResources):
+    """标准训练资源容器"""
+    def __init__(
+        self,
+        model,
+        optimizer,
+        device,
+        lr_scheduler,
+        train_loader,
+        sampler=None,
+        rank=0,
+        world_size=1
+    ):
+        super().__init__(model, optimizer, device, lr_scheduler, rank, world_size)
+        self.train_loader = train_loader
+        self.sampler = sampler
+
+    def cleanup(self):
+        """标准训练特有的清理逻辑"""
+        # 标准训练没有特殊清理需求
+        pass
+
+def _create_resorce_standard(experiment_config, device, lr_scheduler, optimizer, model, rank=0, world_size=1):
+    # 初始化所有资源
+    train_loader, sampler = get_dataloader_standard(
+        experiment_config = experiment_config,
+        rank=rank,
+        world_size=world_size
+    )
+
+    resorces_standard = StandardExperimentResources(model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        device=device,
+        lr_scheduler=lr_scheduler,
+        sampler=sampler,
+        rank=rank,
+        world_size=world_size)
+    return resorces_standard
+
+def _create_resorce_streaming(experiment_config, stream_config, device, lr_scheduler, optimizer, model, rank=0, world_size=1):
+    # 初始化所有资源
+    streaming_dataloader = get_dataloader_streaming(
+        experiment_config = experiment_config,
+        stream_config = stream_config,
+        rank=rank,
+        world_size=world_size
+    )
+
+    resorces_standard = StreamingExperimentResources(model=model,
+        optimizer=optimizer,
+        device=device,
+        lr_scheduler=lr_scheduler,
+        rank=rank,
+        world_size=world_size,
+        streaming_dataloader=streaming_dataloader)
+    return resorces_standard
+
+def compute_training_steps(experiment_config: ExperimentConfig):
+    max_token_num=experiment_config.max_tokens
+    tokens_per_step=experiment_config.batch_size*experiment_config.max_length
+    return max_token_num//tokens_per_step
 
 @contextmanager
-def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1):
+def experiment_manager(experiment_config: ExperimentConfig, stream_config: StreamConfig = None, rank=0, world_size=1, training_mode="streaming"):
     """管理GPU、数据集、模型资源,管理日志打印"""
     step_func_name = experiment_config.step_func_name
     optimizer_name = experiment_config.optimizer_name
@@ -132,7 +229,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     logger.remove()
     if rank == 0:
         sink_id = logger.add(
-            f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", 
+            f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}_batch_size={batch_size}.log", 
             mode="w", level="INFO"
         )
     else:
@@ -148,16 +245,11 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         logger.info(f"🖥️  当前GPU: {torch.cuda.current_device()}")
         logger.info(f"🌐 进程组: {dist.get_world_size()} 个进程")
 
-    # 初始化所有资源
-    model, train_loader, sampler = get_model_and_dataloader(
-        model_name=model_name,
-        dataset_name=dataset_name,
+    # 创建模型
+    model = create_qwen_model(
+        model_name=experiment_config.model_name,
         hidden_size=experiment_config.hidden_size,
-        max_position_embeddings=max_position_embeddings,
-        max_length=max_length,
-        per_gpu_batch_size=batch_size//world_size,
-        rank=rank,
-        world_size=world_size
+        max_position_embeddings=experiment_config.max_position_embeddings
     )
 
     total_params = count_parameters(model)
@@ -186,25 +278,20 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         block_num=experiment_config.block_num,
     )
     
-    num_training_steps = len(train_loader) * max_epochs
+    num_training_steps = compute_training_steps(experiment_config)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
-        num_warmup_steps=min(100, num_training_steps // 10),
+        num_warmup_steps=num_training_steps//20,
         num_training_steps=num_training_steps,
         num_cycles=0.5,
     )
     
-    # 封装资源
-    resources = ExperimentResources(
-        model=model,
-        train_loader=train_loader,
-        optimizer=optimizer,
-        device=device,
-        lr_scheduler=lr_scheduler,
-        sampler=sampler,
-        rank=rank,
-        world_size=world_size
-    )
+    if (training_mode == "streaming"):
+        resources = _create_resorce_streaming(experiment_config, stream_config, device, lr_scheduler, optimizer, model, rank, world_size)
+    elif (training_mode == "standard"):
+        resources = _create_resorce_standard(experiment_config, device, lr_scheduler, optimizer, model, rank, world_size)
+    else:
+        assert 0, f"Training_mode {training_mode} not supported!"
     
     try:
         if rank == 0:
@@ -219,6 +306,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             cleanup_ddp()
         
         # 清理资源引用
+        resources.cleanup()
         del resources
         gc.collect()
         if torch.cuda.is_available():
@@ -228,292 +316,271 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
-# class HangDetector:
-#     """hang检测器"""
-#     def __init__(self, rank, timeout=300):  # 5分钟超时
-#         self.rank = rank
-#         self.timeout = timeout
-#         self.last_activity_time = time.time()
-#         self.active_step = None
-#         self.monitor_thread = None
-#         self.enabled = True
-        
-#     def start_monitoring(self):
-#         """开始监控"""
-#         if self.monitor_thread is None:
-#             self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-#             self.monitor_thread.start()
-#             logger.info(f"Rank {self.rank}: Hang检测器已启动，超时时间 {self.timeout}秒")
-    
-#     def update_activity(self, step_name):
-#         """更新活动状态"""
-#         self.last_activity_time = time.time()
-#         self.active_step = step_name
-#         logger.debug(f"Rank {self.rank}: 活动更新 - {step_name}")
-    
-#     def _monitor_loop(self):
-#         """监控循环"""
-#         while self.enabled:
-#             current_time = time.time()
-#             idle_time = current_time - self.last_activity_time
-            
-#             if idle_time > self.timeout:
-#                 logger.error(f"Rank {self.rank}: ❌ 检测到hang！当前步骤: {self.active_step}, "
-#                            f"已空闲 {idle_time:.0f}秒 (超时: {self.timeout}秒)")
-                
-#                 # 输出详细诊断信息
-#                 self._dump_diagnostic_info()
-                
-#                 # 强制退出进程
-#                 os._exit(1)
-            
-#             # 每分钟记录一次状态
-#             if int(current_time) % 60 == 0:
-#                 logger.info(f"Rank {self.rank}: 监控状态 - 当前步骤: {self.active_step}, "
-#                           f"空闲时间: {idle_time:.0f}秒")
-            
-#             time.sleep(10)  # 每10秒检查一次
-    
-#     def _dump_diagnostic_info(self):
-#         """输出诊断信息"""
-#         import traceback
-#         import sys
-        
-#         logger.error(f"Rank {self.rank}: === HANG诊断信息 ===")
-#         logger.error(f"当前步骤: {self.active_step}")
-#         logger.error(f"进程PID: {os.getpid()}")
-#         logger.error(f"父进程PID: {os.getppid()}")
-#         logger.error(f"活动线程数: {threading.active_count()}")
-        
-#         # 输出所有线程的堆栈
-#         for thread_id, stack in sys._current_frames().items():
-#             logger.error(f"线程 {thread_id} 堆栈:")
-#             for filename, lineno, name, line in traceback.extract_stack(stack):
-#                 logger.error(f"  {filename}:{lineno} in {name}")
-        
-#         # 输出GPU内存信息
-#         if torch.cuda.is_available():
-#             try:
-#                 gpu_memory = torch.cuda.memory_allocated() / 1024**3
-#                 logger.error(f"GPU内存使用: {gpu_memory:.2f} GB")
-#             except:
-#                 logger.error("无法获取GPU内存信息")
-        
-#         logger.error(f"Rank {self.rank}: === 诊断信息结束 ===")
-
-# hang检测版本，目前来看之前的通信问题只是因为bash断联，发的SIGHUP。改用tmux之后没有这个问题
-def train_worker(rank, world_size, experiment_config):
+def train_worker(rank, world_size, experiment_config:ExperimentConfig, stream_config: StreamConfig = None, training_mode="streaming"):
     """DDP训练工作进程"""
-    # 创建hang检测器
-    # hang_detector = HangDetector(rank, timeout=300)  # 5分钟超时
-    # hang_detector.start_monitoring()
+    # experiment_manager创建实验所需全部资源，放到resources里面
+    with experiment_manager(experiment_config, stream_config, rank, world_size, training_mode) as resources:
+        # 初始化训练状态
+        training_state = TrainingState(experiment_config)
+        
+        # 开始训练
+        if training_mode is "standard":
+            _run_standard_training_loop(resources, training_state, experiment_config, rank, world_size)
+        elif training_mode is "streaming":
+            _run_streaming_training_loop(resources, training_state, experiment_config, rank, world_size)
+        # 训练结束处理
+        _finalize_training(resources, training_state, experiment_config, rank)
+        
+        return training_state.cur_loss, training_state.current_interval_loss_sum
+
+class TrainingState:
+    """训练状态容器"""
+    def __init__(self, experiment_config):
+        # 训练统计
+        self.cur_loss=0
+        self.current_interval_loss_sum=0
+        self.epoch_losses=0
+        self.total_tokens_trained = 0
+        self.step = 0
+        self.epoch = 0
+        self.skipped_batches = 0
+        self.stop_training = False
+        
+        # 计算常量
+        self.tokens_per_batch = experiment_config.batch_size * experiment_config.max_length
+        
+        # 吞吐量统计
+        self.train_start_time = time.time()
+        self.last_step_time = self.train_start_time
+        self.step_count_since_last = 0
+        self.tokens_since_last = 0
+
+def _run_standard_training_loop(resources:StandardExperimentResources, training_state:TrainingState, experiment_config:ExperimentConfig, rank):
+    """运行标准训练循环"""
+    # 创建进度条（只在rank 0）
+    if rank == 0:
+        epoch_pbar = tqdm(
+            total=experiment_config.max_tokens,
+            desc=f"Epoch {training_state.epoch+1}",
+            unit="tokens",
+            ncols=120,
+            position=0,
+            leave=True,
+        )
     
-    with experiment_manager(experiment_config, rank, world_size) as resources:
-        model = resources.model
-        train_loader = resources.train_loader
-        optimizer = resources.optimizer
-        device = resources.device
-        lr_scheduler = resources.lr_scheduler
-        sampler = resources.sampler
-        step_func_name = experiment_config.step_func_name
+    while training_state.epoch < experiment_config.max_epochs and not training_state.stop_training:
+        logger.info(f"Rank {rank}: 开始Epoch {training_state.epoch}")
         
-        model.train()
-        losses = []
-        total_tokens_trained = 0
-        batch_size = experiment_config.batch_size
-        max_length = experiment_config.max_length
-        max_tokens = experiment_config.max_tokens
+        resources.sampler.set_epoch(training_state.epoch)
+        total_batches = len(resources.train_loader)
         
-        # 计算每个batch的token数
-        tokens_per_batch = batch_size * max_length
-        tokens_per_epoch = len(train_loader) * tokens_per_batch
-        epoch = 0
-        stop_training = False
-        
-        # === 吞吐量统计变量 ===
-        if rank == 0:
-            train_start_time = time.time()
-            last_step_time = train_start_time
-            step_count_since_last = 0
-            tokens_since_last = 0
-        # ==========================
-        
-        # 外层循环改为基于epoch，内层检查token数
-        while epoch < experiment_config.max_epochs and not stop_training:
-            logger.info(f"Rank {rank}: 开始Epoch {epoch}")
-            #hang_detector.update_activity(f"Epoch {epoch} 开始")
+        for batch in enumerate(resources.train_loader):
+            # 检查跳过批次阈值
+            if training_state.skipped_batches > total_batches * 0.05:
+                logger.error(f"Rank {rank}: ❌ 跳过批次过多 ({training_state.skipped_batches}/{total_batches},"
+                             " {training_state.skipped_batches/total_batches*100:.1f}%)，停止训练")
+                raise
             
-            if sampler:
-                sampler.set_epoch(epoch)
-                
-            epoch_losses = []
-            
-            # 添加跳过批次计数器
-            skipped_batches = 0
-            total_batches = len(train_loader)
-            skip_threshold = total_batches * 0.05  # 5%阈值
-            
-            if rank == 0:
-                epoch_pbar = tqdm(
-                    total=tokens_per_epoch,
-                    desc=f"Epoch {epoch+1}",
-                    unit="tokens",
-                    ncols=100,
-                    position=0,
-                    leave=True,
-                )
-            
-            for step, batch in enumerate(train_loader):
-                #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 获取batch")
-                
-                # 检查跳过批次是否超过阈值
-                if skipped_batches > skip_threshold:
-                    logger.error(f"Rank {rank}: ❌ 跳过批次过多 ({skipped_batches}/{total_batches}, {skipped_batches/total_batches*100:.1f}%)，停止训练")
-                    stop_training = True
-                    break
-                    
-                # 检查是否达到token限制
-                if total_tokens_trained >= max_tokens:
-                    logger.info(f"Rank {rank}: 🎯 已达到目标token数 {max_tokens}, 停止训练")
-                    stop_training = True
+            # 检查token限制
+            if (rank == 0):
+                if training_state.total_tokens_trained >= experiment_config.max_tokens:
+                    logger.info(f"Rank {rank}: 🎯 已达到目标token数 {experiment_config.max_tokens}, 停止训练")
+                    training_state.stop_training = True
                     break
                 
-                try:
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器清零")
-                    optimizer.zero_grad()
-                    
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 数据转移到GPU")
-                    batch = batch.to(device)
-                    input_ids = batch
-                    
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 前向传播")
-                    #logger.debug(f"Rank {rank}: Epoch {epoch} Step {step} 开始前向传播")
-                    outputs = model(input_ids=input_ids, labels=input_ids)
-                    loss = outputs.loss
-                    
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 反向传播")
-                    loss.backward()
-                    
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 优化器步骤")
-                    optimizer.step()
-                    
-                    #hang_detector.update_activity(f"Epoch {epoch} Step {step} - 学习率调度")
-                    lr_scheduler.step()
-                    
-                    current_loss = loss.item()
-                    epoch_losses.append(current_loss)
-                    
-                    # 更新token计数
-                    total_tokens_trained += tokens_per_batch
-                    
-                    # === 新增：吞吐量统计 ===
-                    if rank == 0:
-                        step_count_since_last += 1
-                        tokens_since_last += tokens_per_batch
-                    # ======================
-                        
-                    if step % 1000 == 0:
-                        progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
-                        skip_pct = skipped_batches / (step + 1) * 100 if step > 0 else 0
-                        
-                        # === 每1000步计算吞吐量 ===
-                        throughput_info = ""
-                        if rank == 0:
-                            current_time = time.time()
-                            time_elapsed = current_time - last_step_time
-                            if time_elapsed > 0:
-                                tokens_per_sec = tokens_since_last / time_elapsed
-                                throughput_info = f" Throughput: {tokens_per_sec:.0f} tokens/sec"
-                                
-                                # 重置统计
-                                last_step_time = current_time
-                                step_count_since_last = 0
-                                tokens_since_last = 0
-                            # 更新进度条
-                            epoch_pbar.set_postfix({
-                                'loss': f'{current_loss:.4f}',
-                                'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
-                                'lr': f'{optimizer.param_groups[0]["lr"]:.5e}',
-                                'skipped': f'{skipped_batches}'  # 显示跳过的批次数
-                            })
-                            epoch_pbar.update(tokens_per_batch)
-                        
-                        logger.info(
-                            f"Rank {rank}: StepFunc: {step_func_name} Epoch: {epoch} Step: {step}, "
-                            f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%), {throughput_info}"
-                            f"Loss: {current_loss:.4f} Skipped: {skipped_batches} ({skip_pct:.1f}%),"
-                            f"lr: {optimizer.param_groups[0]["lr"]:.5e}"
-                        )
-                        
-                except RuntimeError as e:
-                    if "DataLoader" in str(e) or "timeout" in str(e).lower():
-                        skipped_batches += 1
-                        skip_pct = skipped_batches / (step + 1) * 100
-                        logger.warning(f"Rank {rank}: DataLoader超时，跳过step {step}, 已跳过 {skipped_batches} 批次 ({skip_pct:.1f}%)")
-                        
-                        # 检查是否接近阈值
-                        if skipped_batches > skip_threshold * 0.8:  # 达到阈值的80%时警告
-                            logger.warning(f"Rank {rank}: ⚠️ 跳过批次接近阈值 ({skipped_batches}/{skip_threshold:.0f})")
-                            
-                        continue  # 跳过当前batch，继续下一个
-                    else:
-                        raise  # 重新抛出其他异常
-            
-            if rank == 0:
-                epoch_pbar.close()
-                
-                # 计算epoch平均损失
-                if epoch_losses:
-                    avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-                    losses.append(avg_epoch_loss)
-                    final_skip_pct = skipped_batches / total_batches * 100 if total_batches > 0 else 0
-                    logger.info(f"Rank {rank}: 📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f},"
-                                f" 跳过批次: {skipped_batches}/{total_batches} ({final_skip_pct:.1f}%)")
-                    
-                    # 保留loss阈值检查作为备选停止条件
-                    if avg_epoch_loss < experiment_config.loss_threshold:
-                        stop_training = True
-                        logger.info(f"Rank {rank}: 🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
+            success = _process_batch(resources, batch, training_state, experiment_config, rank)
+            if not success:
+                training_state.skipped_batches += 1
+                continue
+        
+        # epoch结束处理
+        _finalize_epoch(training_state, rank, total_batches, experiment_config.loss_threshold)
+        
+        # 同步停止信号
+        training_state.stop_training = broadcast_stop_signal(training_state.stop_training, rank)
+        training_state.epoch += 1
+    
+    if rank == 0:
+        epoch_pbar.close()
 
+STREAM_EPOCH_LEN=100
+def _run_streaming_training_loop(resources, training_state:TrainingState, experiment_config:ExperimentConfig, rank):
+    """运行流式训练循环"""
+    # 创建进度条（只在rank 0）
+    if rank == 0:
+        epoch_pbar = tqdm(
+            total=experiment_config.max_tokens,
+            desc=f"Epoch {training_state.epoch+1}",
+            unit="tokens",
+            ncols=120,
+            position=0,
+            leave=True,
+        )
+    while not training_state.stop_training:
+        training_state.epoch_losses=0
+        while training_state.step < STREAM_EPOCH_LEN:
+            # 获取下一个batch
+            batch = resources.streaming_dataloader.get_next_batch()
+            if batch is None:
+                logger.info(f"Rank {rank}: 没有更多数据，停止训练")
+                raise
+                
+            _process_batch(resources, batch, training_state, experiment_config, rank)
+        if rank == 0 and training_state.total_tokens_trained >= experiment_config.max_tokens:
+            training_state.stop_training=True
+            training_state.epoch_losses /= STREAM_EPOCH_LEN
             # 同步停止信号
-            #logger.debug(f"Rank {rank}: 同步停止信号, 当前stop_training={stop_training}")
-            #hang_detector.update_activity("同步停止信号")
-            stop_training = broadcast_stop_signal(stop_training, rank)
-            logger.info(f"Rank {rank}: Epoch {epoch} 完成, 累计token: {total_tokens_trained}")
-            
-            epoch += 1
-        
-        # 停止hang检测器
-        #hang_detector.enabled = False
-        
-        # === 训练结束时的总吞吐量统计 ===
-        final_throughput_info = ""
-        if rank == 0:
-            train_end_time = time.time()
-            total_train_time = train_end_time - train_start_time
-            if total_train_time > 0:
-                overall_throughput = total_tokens_trained / total_train_time
-                final_throughput_info = f" 总吞吐量: {overall_throughput:.0f} tokens/sec (总时间: {total_train_time:.1f}秒)"
-        
-        final_loss = losses[-1] if losses else float('inf')
-        avg_epoch_loss = losses[-1] if losses else float('inf')
-        logger.info(f"Rank {rank}: 训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, "
-                   f"final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss:.4f}, {final_throughput_info}")
-        return final_loss, losses
+            training_state.stop_training = broadcast_stop_signal(training_state.stop_training, rank)
+    
+    if rank == 0:
+        epoch_pbar.close()
 
-def run_experiment(experiment_config: ExperimentConfig):
-    """运行单个实验，支持DDP"""
+def _process_batch(resources:BaseExperimentResources, batch, state:TrainingState, experiment_config:ExperimentConfig, rank):
+    """处理单个batch的训练"""
+    # 优化器清零
+    resources.optimizer.zero_grad()
+    
+    # 数据转移到GPU
+    batch = batch.to(resources.device, non_blocking=True)
+    # 前向传播
+    outputs = resources.model(input_ids=batch, labels=batch)
+    loss = outputs.loss
+    
+    # 反向传播
+    loss.backward()
+    resources.optimizer.step()
+    resources.lr_scheduler.step()
+    
+    current_loss = loss.item()
+    state.current_interval_loss_sum += current_loss
+    state.epoch_losses += current_loss
+    
+    # 更新统计
+    state.total_tokens_trained += state.tokens_per_batch
+    state.step += 1
+    
+    # 吞吐量统计
+    if rank == 0:
+        state.step_count_since_last += 1
+        state.tokens_since_last += state.tokens_per_batch
+        log_interval = 100
+        # 日志记录
+        if state.step % log_interval == 0:
+            avg_loss = state.current_interval_loss_sum/log_interval
+            state.current_interval_loss_sum=0
+            _log_training_progress(state, experiment_config, rank, resources.optimizer.param_groups[0]['lr'], avg_loss)
+    
+    return True
+
+def _log_training_progress(state:TrainingState, experiment_config:ExperimentConfig, rank, cur_lr, avg_loss):
+    """记录训练进度"""
+    progress_pct = state.total_tokens_trained/experiment_config.max_tokens*100 if experiment_config.max_tokens != float('inf') else 0
+    skip_pct = state.skipped_batches*state.tokens_per_batch / experiment_config.max_tokens * 100 if state.skipped_batches > 0 else 0
+    
+    # 吞吐量计算
+    throughput_info = ""
+    if rank == 0:
+        current_time = time.time()
+        time_elapsed = current_time - state.last_step_time
+        if time_elapsed > 0:
+            tokens_per_sec = state.tokens_since_last / time_elapsed
+            throughput_info = f" Throughput: {tokens_per_sec:.0f} tokens/sec"
+            
+            # 重置统计
+            state.last_step_time = current_time
+            state.step_count_since_last = 0
+            state.tokens_since_last = 0
+
+    logger.info(
+        f"Rank {rank}: StepFunc: {experiment_config.step_func_name} "
+        f"Epoch: {state.epoch} Step: {state.step}, "
+        f"Tokens: {state.total_tokens_trained}/{experiment_config.max_tokens} ({progress_pct:.1f}%), {throughput_info}"
+        f"Loss: {avg_loss:.4f} Skipped: {state.skipped_batches} ({skip_pct:.1f}%),"
+        f"lr: {cur_lr:.5e}"
+    )
+
+def _finalize_epoch(state:TrainingState, rank, batches_per_epoch, loss_threshold):
+    avg_epoch_loss = state.epoch_losses / batches_per_epoch
+    final_skip_pct = state.skipped_batches / batches_per_epoch * 100
+    logger.info(f"Rank {rank}: 📊 Epoch {state.epoch} 平均损失: {avg_epoch_loss:.4f},"
+                f" 跳过批次: {state.skipped_batches}/{batches_per_epoch} ({final_skip_pct:.1f}%)")
+    
+    # 检查损失阈值
+    if avg_epoch_loss < loss_threshold:
+        state.stop_training = True
+        logger.info(f"Rank {rank}: 🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
+
+def _finalize_training(state:TrainingState, rank):
+    # 最终统计
+    final_throughput_info = ""
+    if rank == 0:
+        train_end_time = time.time()
+        total_train_time = train_end_time - state.train_start_time
+        if total_train_time > 0:
+            overall_throughput = state.total_tokens_trained / total_train_time
+            final_throughput_info = f" 总吞吐量: {overall_throughput:.0f} tokens/sec (总时间: {total_train_time:.1f}秒)"
+    
+    logger.info(f"Rank {rank}: 训练结束。总token数: {state.total_tokens_trained:,}, "
+        f"stop_training={state.stop_training}, epoch_losses: {state.epoch_losses:.4f}{final_throughput_info}")
+
+def run_experiment(experiment_config: ExperimentConfig, stream_config: StreamConfig = None, training_mode: str = "standard"):
+    """运行单个实验，支持DDP和流式训练
+    
+    Args:
+        experiment_config: 实验配置
+        stream_config: 流式训练配置（仅流式训练需要）
+        training_mode: 训练模式，"standard" 或 "streaming"
+    """
     world_size = torch.cuda.device_count()
     
-    if world_size > 1:
-        # 多GPU使用DDP
-        mp.spawn(
-            train_worker,
-            args=(world_size, experiment_config),
-            nprocs=world_size,
-            join=True
-        )
-        return None, None
-    else:
-        # 单GPU直接调用训练函数
-        return train_worker(0, 1, experiment_config)
+    # 验证参数
+    if training_mode == "streaming" and stream_config is None:
+        raise ValueError("流式训练需要提供 stream_config")
+
+    # 共享内存创建器（只在流式训练中使用）
+    shared_memory_creator = None
+    loader_processes = []
+    
+    try:
+        # 流式训练：在主进程创建共享内存
+        if training_mode == "streaming" and stream_config is not None:
+            shared_memory_creator = SharedMemoryCreator(stream_config)
+            shared_info = shared_memory_creator.create_shared_memory() # 这里面已经包含了创建共享内存，初始化管理区域，并且关闭了fd，unmap
+            
+            # 启动数据加载进程（只在主进程）
+            loader_processes = start_data_loaders(
+                dataset_name=experiment_config.dataset_name,
+                stream_config=stream_config,
+                shared_info=shared_info,
+                file_list=load_dataset_from_files(experiment_config.dataset_name),  # 需要获取文件列表
+                tokenizer_name=experiment_config.model_name  # 使用config中的模型名称
+            )
+        
+        # 运行训练
+        if world_size > 1:
+            # 多GPU使用DDP
+            mp.spawn(
+                train_worker,
+                args=(world_size, experiment_config, training_mode, stream_config),
+                nprocs=world_size,
+                join=True
+            )
+            final_loss, losses = None, None
+        else:
+            # 单GPU直接调用训练函数
+            final_loss, losses = train_worker(0, 1, experiment_config, training_mode, stream_config)
+        
+        return final_loss, losses
+        
+    finally:
+        # 清理资源
+        _cleanup_experiment_resources(loader_processes, shared_memory_creator, training_mode)
+
+def _cleanup_experiment_resources(loader_processes, shared_memory_creator, training_mode):
+    if training_mode == "streaming":
+        # 使用专门的停止函数
+        stop_data_loaders(loader_processes)
+        # 清理共享内存
+        if shared_memory_creator:
+            logger.info("清理共享内存...")
+            shared_memory_creator.cleanup()

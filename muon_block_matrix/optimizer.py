@@ -237,7 +237,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
 
             # generate weight updates
-            for p in params:
+            for p in params: # 对每个参数进行卸载操作
                 # sanity check
                 g = p.grad
                 if g is None:
