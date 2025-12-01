@@ -12,23 +12,57 @@ from loguru import logger
 from typing import List, Dict, Any, Optional
 
 from .share_mem_manager import StreamConfig, SharedBufferManager
-from .config import TOKENIZED_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE, MODEL_CACHE
-#=================================================================
+from .config import TOKENIZED_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE, MODEL_CACHE, DATASET_PATH
+# 工具函数
+def distribute_files_statically(all_files: List[str], num_loaders: int) -> List[List[str]]:
+    """静态分配文件给各个加载进程
+    
+    Args:
+        all_files: 所有数据文件路径
+        num_loaders: 加载进程数量
+        
+    Returns:
+        二维列表，file_lists[i] 是第 i 个进程分配到的文件
+    """
+    # 全局打乱一次
+    shuffled_files = random.sample(all_files, len(all_files))
+    
+    # 计算每个进程分配的文件数
+    files_per_loader = len(shuffled_files) // num_loaders
+    remainder = len(shuffled_files) % num_loaders
+    
+    file_lists = []
+    start_idx = 0
+    
+    for i in range(num_loaders):
+        # 计算当前进程的文件数（前 remainder 个进程多分配一个文件）
+        current_files_count = files_per_loader + (1 if i < remainder else 0)
+        end_idx = start_idx + current_files_count
+        
+        assigned_files = shuffled_files[start_idx:end_idx]
+        file_lists.append(assigned_files)
+        
+        logger.info(f"分配进程 {i}: {len(assigned_files)} 个文件 "
+                   f"(范围 {start_idx}-{end_idx-1})")
+        
+        start_idx = end_idx
+    
+    logger.info(f"文件分配完成: 总文件数 {len(all_files)}, "
+               f"分配进程数 {num_loaders}, 平均每个进程 {files_per_loader} 文件")
+    
+    return file_lists
 
 class DataLoaderProcess:
     """数据加载进程 - 负责流式读取文件、tokenize、写入共享缓冲区"""
     def __init__(self, process_id: int, stream_config: StreamConfig, shared_info: Dict[str, Any],
-                 dataset_name: str, tokenizer_name: str, file_list: List[str]):
+                 dataset_name: str, tokenizer_name: str, assigned_files: List[str]):
         self.process_id = process_id
         self.dataset_name = dataset_name
         self.tokenizer_name = tokenizer_name
-        self.file_list = file_list
         self.running = True
         self.stream_config = stream_config
         self.shared_info = shared_info
-        
-        # 静态文件分配 - 避免重叠
-        self.assigned_files = self._assign_files_statically()
+        self.assigned_files = assigned_files
         self.current_file_index = 0
         self.epoch_count = 0
         self.total_samples_processed = 0
@@ -39,26 +73,6 @@ class DataLoaderProcess:
             cache_dir=MODEL_CACHE,
             local_files_only=True
         )
-        
-        logger.info(f"Loader {process_id}: 初始化完成, 分配文件数: {len(self.assigned_files)}")
-    
-    def _assign_files_statically(self) -> List[str]:
-        """静态分配文件，确保不重叠"""
-        # 打乱文件确保随机性
-        shuffled_files = random.sample(self.file_list, len(self.file_list))
-        
-        # 按进程数量分配
-        files_per_loader = len(shuffled_files) // self.stream_config.num_loaders
-        start_idx = self.process_id * files_per_loader
-        end_idx = start_idx + files_per_loader
-        
-        # 最后一个进程处理剩余文件
-        if self.process_id == self.stream_config.num_loaders - 1:
-            end_idx = len(shuffled_files)
-            
-        assigned = shuffled_files[start_idx:end_idx]
-        logger.info(f"Loader {self.process_id}: 分配文件范围 {start_idx}-{end_idx}, 实际文件数: {len(assigned)}")
-        return assigned
     
     def run(self):
         """主运行循环 - 无限数据流"""
@@ -203,7 +217,83 @@ class DataLoaderProcess:
         
         logger.debug(f"Loader {self.process_id}: 从 {file_path} 读取 {len(samples)} 样本")
         return samples
-    
+    def _collect_samples_for_chunk(self) -> List[str]:
+        """通过tokenize收集固定长度的样本"""
+        samples_needed = self.buffer_manager.config.batches_per_chunk * self.buffer_manager.config.batch_size
+        collected_samples = []
+        
+        current_tokens = []  # 当前累积的tokens
+        
+        max_attempts = 10
+        attempts = 0
+        
+        while len(collected_samples) < samples_needed and self.running and attempts < max_attempts:
+            attempts += 1
+            
+            # 检查是否需要开始新epoch
+            if self.current_file_index >= len(self.assigned_files):
+                self._start_new_epoch()
+            
+            # 从当前文件读取并处理
+            current_file = self.assigned_files[self.current_file_index]
+            new_samples = self._read_and_tokenize_file(current_file, current_tokens)
+            
+            if not new_samples and not current_tokens:
+                # 当前文件已读完且没有剩余tokens，移动到下一个文件
+                self.current_file_index += 1
+                continue
+            
+            # 将新样本添加到结果中
+            collected_samples.extend(new_samples)
+            
+            # 如果收集够了，提前退出
+            if len(collected_samples) >= samples_needed:
+                break
+        
+        # 处理剩余情况
+        if len(collected_samples) < samples_needed:
+            logger.warning(f"样本不足，丢弃当前批次")
+            return []
+        
+        # 打乱顺序
+        random.shuffle(collected_samples)
+        return collected_samples
+
+    def _read_and_tokenize_file(self, file_path: str, current_tokens: List[int]) -> List[str]:
+        """读取文件并返回固定token长度的样本"""
+        samples = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    
+                    # tokenize当前行
+                    line_tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                    
+                    # 将当前行的tokens添加到累积中
+                    current_tokens.extend(line_tokens)
+                    
+                    # 如果累积的tokens达到或超过目标长度，创建样本
+                    while len(current_tokens) >= self.target_length:
+                        # 取前target_length个tokens作为样本
+                        sample_tokens = current_tokens[:self.target_length]
+                        sample_text = self.tokenizer.decode(sample_tokens)
+                        samples.append(sample_text)
+                        
+                        # 移除已使用的tokens
+                        current_tokens = current_tokens[self.target_length:]
+            
+            # 文件读取完成，如果有剩余的tokens但不足目标长度，保留在current_tokens中供下一个文件使用
+            logger.debug(f"从 {file_path} 生成 {len(samples)} 个样本，剩余 {len(current_tokens)} 个tokens")
+            
+        except Exception as e:
+            logger.error(f"读取文件 {file_path} 错误: {e}")
+        
+        return samples
+
     def _tokenize_samples(self, samples: List[str]) -> Optional[torch.Tensor]:
         """Tokenize样本并组装成batch - 添加格式验证"""
         if not samples:
@@ -253,12 +343,17 @@ class DataLoaderProcess:
         logger.info(f"Loader {self.process_id}: 停止信号接收")
 
 # 工具函数
-def start_data_loaders(dataset_name: str,  stream_config: StreamConfig, shared_info: Dict[str, Any],
-                      file_list: List[str], tokenizer_name: str = "Qwen/Qwen2.5-0.5B") -> List:
-    """启动数据加载进程"""
+def start_data_loaders(self, dataset_name: str, stream_config: StreamConfig, shared_info: Dict[str, Any],
+                      file_lists: List[List[str]], tokenizer_name: str = "Qwen/Qwen2.5-0.5B") -> List:
+    """启动数据加载进程
+    Args:
+        file_lists: 二维列表，file_lists[i] 是第 i 个进程分配到的文件列表
+    """
     processes = []
     for i in range(stream_config.num_loaders):
-        loader = DataLoaderProcess(i, stream_config, shared_info, dataset_name, tokenizer_name, file_list)
+        # 每个进程获得预先分配的文件列表
+        assigned_files = file_lists[i] if i < len(file_lists) else []
+        loader = DataLoaderProcess(i, stream_config, shared_info, dataset_name, tokenizer_name, assigned_files)
         p = torch.multiprocessing.Process(target=loader.run, daemon=True)
         p.start()
         processes.append((p, loader))
@@ -292,14 +387,13 @@ def get_all_data_files(data_dir: str, extensions: List[str] = None) -> List[str]
     logger.info(f"找到 {len(file_list)} 个数据文件在目录 {data_dir}")
     return file_list
 
+OUTPUT_DIR = os.path.join(DATASET_PATH, "openwebtext/output")
 def load_dataset_from_files(dataset_name: str) -> List[str]:
     """根据数据集名称获取文件列表"""
     # 这里根据您的实际数据集配置实现
     # 示例：从配置或固定路径获取
     if dataset_name == "openwebtext":
-        data_dir = "/path/to/openwebtext/files"
-    elif dataset_name == "wikitext":
-        data_dir = "/path/to/wikitext/files"
+        data_dir = OUTPUT_DIR
     else:
         raise ValueError(f"未知数据集: {dataset_name}")
     
@@ -355,6 +449,9 @@ class StreamingMoonDataset:
         
         # 获取当前rank对应的batch
         batch = self._get_batch_for_rank(self.current_batch_index)
+        logger.info(f"114514 [get_next_batch]: current_buffer_id = {self.current_buffer_id}, rank = {self.rank}"
+                    f"current_batch_index = {self.current_batch_index}"
+                    f"batch content :")
         self.current_batch_index += 1
         self.total_batches_processed += 1
         self.total_tokens_processed += self.config.batch_size * self.config.max_length
@@ -410,6 +507,7 @@ class StreamingMoonDataset:
 
         # 到这一步必然获取到合法的chunkID，从共享内存读取本训练进程的数据
         self.current_buffer_id = buffer_id
+        logger.info(f"114514 [_acquire_new_chunk_sync]: current_buffer_id = {self.current_buffer_id}, rank = {self.rank}")
         chunk_data = self.buffer_manager.read_from_buffer(buffer_id, self.rank)
         if chunk_data is None:
             self.buffer_manager.release_read_buffer(buffer_id)
@@ -629,15 +727,12 @@ class ExperimentPreparer:
     def _tokenize_single_process(self):
         """单进程处理"""
         logger.info("Using single-process tokenization")
-        
-        # 修正：将 texts 分成批次，与多进程模式保持一致
+
         batches = [self.texts[i:i + self.batch_size] for i in range(0, len(self.texts), self.batch_size)]
         worker_input = (0, batches, self.tokenizer_name, self.model_cache_dir)
-        
-        # 直接调用 worker 函数
+
         _, all_tokens, _ = self._tokenize_worker(worker_input)
-        
-        # 保存结果
+
         torch.save(all_tokens, self.output_file)
         logger.info(f"Single-process tokenization finished -> {len(all_tokens)} tokens")
         return all_tokens

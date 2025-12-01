@@ -2,14 +2,30 @@ import ctypes
 import os
 import numpy as np
 import torch
+from loguru import logger
 from typing import Dict, Any
 
+from .config import StreamConfig
+
 # 加载编译好的C扩展
-try:
-    lib = ctypes.CDLL('./libshm_mutex.so')
-except Exception as e:
-    print(f"Warning: Could not load libshm_mutex.so: {e}")
-    lib = None
+def load_shared_library():
+    """加载共享内存库"""
+    # 获取当前模块所在的目录
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    so_path = os.path.join(current_dir, 'libshm_mutex.so')
+    
+    try:
+        lib = ctypes.CDLL(so_path)
+        print(f"✅ 成功加载共享库: {so_path}")
+        return lib
+    except Exception as e:
+        print(f"❌ 加载共享库失败: {e}")
+        print(f"   尝试路径: {so_path}")
+        print(f"   当前工作目录: {os.getcwd()}")
+        print(f"   模块目录: {current_dir}")
+        return None
+
+lib = load_shared_library()
 
 # 定义C结构体
 class ShmHeader(ctypes.Structure):
@@ -26,27 +42,6 @@ class BufferControl(ctypes.Structure):
         ("mutex", ctypes.c_byte * 40),  # pthread_mutex_t
         ("padding", ctypes.c_byte * 20)  # 填充到64字节
     ]
-
-class StreamConfig:
-    """流式数据配置"""
-    def __init__(
-        self,
-        batches_per_chunk: int = 1024,
-        num_buffers: int = 16,
-        num_loaders: int = 4,
-        max_length: int = 512,
-        batch_size: int = 32,
-        loader_rest_threshold: float = 0.8,
-        world_size: int =8, # 缓冲区被多少个训练进程读取
-    ):
-        assert (batch_size % world_size) is 0
-        self.batches_per_chunk = batches_per_chunk
-        self.num_buffers = num_buffers
-        self.num_loaders = num_loaders
-        self.max_length = max_length
-        self.batch_size = batch_size
-        self.loader_rest_threshold = loader_rest_threshold
-        self.world_size = world_size
 
 TOKEN_ID_BYTES = 8  # 与训练进程保持一致，训练进程需要长度为8B，避免转换
 class SharedMemoryCreator:
@@ -181,34 +176,61 @@ class SharedBufferManager:
                 self._unlock_buffer(buffer_id)
     
     def write_to_buffer(self, buffer_id: int, token_data: torch.Tensor):
-        """写入数据到缓冲区"""
-        chunk_array = token_data.numpy().flatten().astype(np.int32)
+        """写入数据到缓冲区 - 使用8字节数据格式"""
+        # 转换为int64类型并展平
+        chunk_array = token_data.numpy().flatten().astype(np.int64)
         
-        # 计算数据偏移量
+        # 计算数据偏移量 - 使用8字节
         buffer_size = self.config.batches_per_chunk * self.config.batch_size * self.config.max_length * TOKEN_ID_BYTES
         data_offset = buffer_id * buffer_size
         
-        # 获取数据指针
-        data_ptr = ctypes.cast(self.data_addr + data_offset, ctypes.POINTER(ctypes.c_int32))
+        # 获取数据指针 - 使用c_int64
+        data_ptr = ctypes.cast(self.data_addr + data_offset, ctypes.POINTER(ctypes.c_int64))
         
         # 批量拷贝
         for i in range(len(chunk_array)):
             data_ptr[i] = chunk_array[i]
         
+        # 计算每个rank的数据信息
+        total_samples = self.config.batches_per_chunk * self.config.batch_size * self.config.max_length
+        samples_per_rank = total_samples // self.config.world_size
+        # 打印写入日志 - 显示每个rank对应的数据
+        logger.info(f"114514 - WRITE: Buffer {buffer_id} - 完整数据分布:")
+        
+        for rank_id in range(self.config.world_size):
+            # 计算当前rank在chunk中的偏移量
+            rank_offset = rank_id * samples_per_rank
+            rank_data = chunk_array[rank_offset:rank_offset + samples_per_rank]
+            
+            # 重塑为 [batches_per_chunk, batch_size//world_size, max_length]
+            batches_per_chunk = self.config.batches_per_chunk
+            partial_batch_size = self.config.batch_size // self.config.world_size
+            max_length = self.config.max_length
+            
+            try:
+                reshaped_data = rank_data.reshape(batches_per_chunk, partial_batch_size, max_length)
+                
+                # 打印每个rank的第一个minibatch的第一个样本的前10个token
+                first_minibatch_tokens = reshaped_data[0, 0, :10].tolist()
+                logger.info(f"114514 -   Rank {rank_id}: tokens[{first_minibatch_tokens}]")
+                
+            except ValueError as e:
+                logger.info(f"114514 -   Rank {rank_id}: 重塑失败 - {e}")
+        
         self.release_write_buffer(buffer_id)
-    
+
     def read_from_buffer(self, buffer_id: int, rank_id: int) -> torch.Tensor:
-        """从缓冲区读取指定rank的数据部分"""
+        """从缓冲区读取指定rank的数据部分 - 使用8字节数据格式"""
         # 计算整个chunk的大小和当前rank的数据偏移量
         total_samples = self.config.batches_per_chunk * self.config.batch_size * self.config.max_length
         samples_per_rank = total_samples // self.config.world_size
         
-        # 计算整个chunk的偏移量和当前rank的偏移量
-        buffer_offset = buffer_id * total_samples * TOKEN_ID_BYTES  # 整个chunk的偏移量
+        # 计算整个chunk的偏移量和当前rank的偏移量 - 使用8字节
+        buffer_offset = buffer_id * total_samples * TOKEN_ID_BYTES  # 整个chunk的偏移量，8 bytes per token
         rank_offset = buffer_offset + rank_id * samples_per_rank * TOKEN_ID_BYTES  # 当前rank的偏移量
         
-        # 获取当前rank数据部分的指针
-        data_ptr = ctypes.cast(self.data_addr + rank_offset, ctypes.POINTER(ctypes.c_int32))
+        # 获取当前rank数据部分的指针 - 使用c_int64
+        data_ptr = ctypes.cast(self.data_addr + rank_offset, ctypes.POINTER(ctypes.c_int64))
         
         # 转换为numpy数组（只读取当前rank的数据）
         rank_array = np.ctypeslib.as_array(data_ptr, (samples_per_rank,))
@@ -220,9 +242,19 @@ class SharedBufferManager:
         
         try:
             reshaped_data = rank_array.reshape(batches_per_chunk, partial_batch_size, max_length)
+            
+            # 添加日志
+            logger.info(f"114514 - READ: Rank {rank_id} <- Buffer {buffer_id}, tokens: [", end="")
+            first_batch = reshaped_data[0, 0, :min(10, max_length)]
+            for i in range(len(first_batch)):
+                logger.info(f"{first_batch[i]}", end="")
+                if i < len(first_batch)-1:
+                    logger.info(", ", end="")
+            logger.info("]")
+            
             return torch.from_numpy(reshaped_data.copy())
         except ValueError as e:
-            print(f"Buffer {buffer_id} rank {rank_id} reshape failed: {e}")
+            logger.info(f"114514 - ERROR: Buffer {buffer_id} rank {rank_id} reshape failed: {e}")
             return None
     
     def get_buffer_stats(self) -> Dict[str, Any]:

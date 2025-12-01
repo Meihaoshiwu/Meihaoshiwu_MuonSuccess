@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from .config import *
 from .model import create_qwen_model
-from .data import StreamingMoonDataset, MoonDataset, start_data_loaders, stop_data_loaders, load_dataset_from_files
+from .data import StreamingMoonDataset, MoonDataset, start_data_loaders, stop_data_loaders, load_dataset_from_files, distribute_files_statically
 from .optimizer import get_optimizer, STEP_MAP
 from .share_mem_manager import SharedMemoryCreator, SharedBufferManager, StreamConfig
 
@@ -275,7 +275,7 @@ def experiment_manager(experiment_config: ExperimentConfig, stream_config: Strea
         model=original_model,
         lr=lr, 
         wd=experiment_config.wd,
-        block_num=experiment_config.block_num,
+        matrix_block_num=experiment_config.matrix_block_num,
     )
     
     num_training_steps = compute_training_steps(experiment_config)
@@ -324,9 +324,9 @@ def train_worker(rank, world_size, experiment_config:ExperimentConfig, stream_co
         training_state = TrainingState(experiment_config)
         
         # 开始训练
-        if training_mode is "standard":
+        if training_mode == "standard":
             _run_standard_training_loop(resources, training_state, experiment_config, rank, world_size)
-        elif training_mode is "streaming":
+        elif training_mode == "streaming":
             _run_streaming_training_loop(resources, training_state, experiment_config, rank, world_size)
         # 训练结束处理
         _finalize_training(resources, training_state, experiment_config, rank)
@@ -523,7 +523,7 @@ def _finalize_training(state:TrainingState, rank):
     logger.info(f"Rank {rank}: 训练结束。总token数: {state.total_tokens_trained:,}, "
         f"stop_training={state.stop_training}, epoch_losses: {state.epoch_losses:.4f}{final_throughput_info}")
 
-def run_experiment(experiment_config: ExperimentConfig, stream_config: StreamConfig = None, training_mode: str = "standard"):
+def run_experiment(experiment_config: ExperimentConfig, stream_config: StreamConfig = None, training_mode: str = "streaming", world_size = torch.cuda.device_count()):
     """运行单个实验，支持DDP和流式训练
     
     Args:
@@ -531,8 +531,6 @@ def run_experiment(experiment_config: ExperimentConfig, stream_config: StreamCon
         stream_config: 流式训练配置（仅流式训练需要）
         training_mode: 训练模式，"standard" 或 "streaming"
     """
-    world_size = torch.cuda.device_count()
-    
     # 验证参数
     if training_mode == "streaming" and stream_config is None:
         raise ValueError("流式训练需要提供 stream_config")
@@ -547,12 +545,14 @@ def run_experiment(experiment_config: ExperimentConfig, stream_config: StreamCon
             shared_memory_creator = SharedMemoryCreator(stream_config)
             shared_info = shared_memory_creator.create_shared_memory() # 这里面已经包含了创建共享内存，初始化管理区域，并且关闭了fd，unmap
             
+            all_files=load_dataset_from_files(experiment_config.dataset_name)  # 需要获取文件列表
+            file_lists=distribute_files_statically(all_files, stream_config.num_loaders)
             # 启动数据加载进程（只在主进程）
             loader_processes = start_data_loaders(
                 dataset_name=experiment_config.dataset_name,
                 stream_config=stream_config,
                 shared_info=shared_info,
-                file_list=load_dataset_from_files(experiment_config.dataset_name),  # 需要获取文件列表
+                file_list=file_lists,
                 tokenizer_name=experiment_config.model_name  # 使用config中的模型名称
             )
         

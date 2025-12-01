@@ -1,5 +1,6 @@
 import argparse
 import os
+import torch.cuda
 from loguru import logger
 
 # 诊断导入
@@ -23,7 +24,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
-    parser.add_argument("--dataset", type=str, default="openwebtext-100k-local_txt")
+    parser.add_argument("--dataset", type=str, default="openwebtext")
     parser.add_argument("--hidden_size", type=int, default=1024) # 一个词使用多长的向量来表示（词向量维数）
     parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
     parser.add_argument("--max_length", type=int, default=512)
@@ -32,7 +33,7 @@ def main():
     parser.add_argument("--loss_threshold", type=float, default=0.1)
     parser.add_argument("--max_epochs", type=int, default=1000)
     parser.add_argument("--max_tokens", type=int, default=10000000000, help="最大训练token数量")
-    parser.add_argument("--block_num", type=int, default=16, help="最大训练token数量")
+    parser.add_argument("--matrix_block_num", type=int, default=4, help="矩阵分块数")
     args = parser.parse_args()
 
     timestamp = get_timestamp()
@@ -53,7 +54,7 @@ def main():
         lr=args.lr,
         wd=args.wd,
         max_tokens=args.max_tokens,
-        block_num=args.block_num,
+        matrix_block_num=args.matrix_block_num,
     )
 
     print(f"🧪 开始自动化实验序列")
@@ -61,27 +62,28 @@ def main():
     print(f"使用数据集缓存: {DATASET_CACHE}")
     print(f"使用分词缓存: {TOKENIZED_CACHE}")
     
-    results = {}
-    for i, (func_name, config_dict) in enumerate(STEP_MAP.items()):
+    BATCHS_PER_CHUNK = 1024
+    SHAREMEM_BUFFER_NUM = 16
+    LOADER_PROCESS_NUM=4
+    LOADER_REST_THRESHOLD=0.8
+    world_size = torch.cuda.device_count()
+    stream_config = StreamConfig(
+        batches_per_chunk=BATCHS_PER_CHUNK,
+        num_buffers=SHAREMEM_BUFFER_NUM,
+        num_loaders=LOADER_PROCESS_NUM,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        loader_rest_threshold=LOADER_REST_THRESHOLD,
+        world_size=world_size, # 缓冲区被多少个训练进程读取
+    )
+    for _, (func_name, config_dict) in enumerate(STEP_MAP.items()):
         # 运行实验
         experiment_config.step_func_name = func_name
         experiment_config.step_func = config_dict.get("step_func")
-        final_loss, all_losses = run_experiment(experiment_config)
+        run_experiment(experiment_config, stream_config, training_mode="streaming", world_size=world_size)
         
-        # 保存结果
-        # results[func_name] = {
-        #     'final_loss': final_loss,
-        #     'all_losses': all_losses,
-        #     'converged': final_loss < experiment_config.loss_threshold
-        # }
-        
-        # 为下一个实验等待一下，确保资源释放
         import time
         time.sleep(5)
-    
-    # for exp_name, result in results.items():
-    #     status = "✅ 收敛" if result['converged'] else "❌ 未收敛"
-    #     print(f"{exp_name}: 最终损失 = {result['final_loss']:.4f} {status}")
 
 if __name__ == "__main__":
     main()

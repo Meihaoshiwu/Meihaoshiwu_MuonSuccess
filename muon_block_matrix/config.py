@@ -64,7 +64,7 @@ class ExperimentConfig():
         wd=DEFAULT_WD, #AdamW使用
         sampler=None,
         max_tokens=None,  # 新增：最大token数量
-        block_num=4,      # 控制分快数量
+        matrix_block_num=4,      # 要正交化的矩阵分块数量
         ):
         self.step_func_name = step_func_name
         self.step_func=step_func
@@ -82,10 +82,31 @@ class ExperimentConfig():
         self.wd = wd
         self.sampler = sampler
         self.max_tokens = max_tokens or float('inf')  # 默认无限制
-        self.block_num = block_num
+        self.matrix_block_num = matrix_block_num
     
     def __repr__(self):
         return (f"ExperimentConfig(step_func_name={self.step_func_name}, "
                 f"model_name={self.model_name}, dataset_name={self.dataset_name}, "
                 f"hidden_size={self.hidden_size}, max_tokens={self.max_tokens}, "
                 f"max_epochs={self.max_epochs}, lr={self.lr}, wd={self.wd})")
+
+class StreamConfig:
+    """流式数据配置"""
+    def __init__(
+        self,
+        batches_per_chunk: int = 1024,
+        num_buffers: int = 16,
+        num_loaders: int = 4,
+        max_length: int = 512,
+        batch_size: int = 32,
+        loader_rest_threshold: float = 0.8,
+        world_size: int =8, # 缓冲区被多少个训练进程读取
+    ):
+        assert (batch_size % world_size) == 0
+        self.batches_per_chunk = batches_per_chunk
+        self.num_buffers = num_buffers
+        self.num_loaders = num_loaders
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.loader_rest_threshold = loader_rest_threshold
+        self.world_size = world_size
