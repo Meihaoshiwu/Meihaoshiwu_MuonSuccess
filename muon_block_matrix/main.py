@@ -18,9 +18,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="openwebtext-100k-local_txt")
-    parser.add_argument("--hidden_size", type=int, default=512) # 一个词使用多长的向量来表示（词向量维数）
+    parser.add_argument("--hidden_size", type=int, default=1024) # 一个词使用多长的向量来表示（词向量维数）
     parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--max_length", type=int, default=1024)
     # 每个样本有多少个token（即词向量）这决定了局部连续文本长度，影响学习效率，如果文本太短很难学习到词语之间联系
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--loss_threshold", type=float, default=0.1)
