@@ -316,7 +316,7 @@ def train_worker(rank, world_size, experiment_config):
                     logger.info(
                         f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
                         f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"Loss: {current_loss:.4f}, lr = {optimizer.param_groups[0]["lr"]}"
+                        f"Loss: {current_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}"
                     )
             
             if rank == 0:

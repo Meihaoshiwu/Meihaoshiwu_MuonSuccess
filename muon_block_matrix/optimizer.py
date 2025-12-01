@@ -1,7 +1,7 @@
 import math
 import torch
 import os
-
+from loguru import logger
 # ---- 牛顿-舒尔茨正交化 ----
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'  # 限制编译线程数量，避免编译线程抢占太多资源影响进程通信
 @torch.compile
@@ -83,6 +83,133 @@ def step_row_block_process_one(G, steps):
     
     return result
 
+# 随机处理其中某一个矩阵
+def step_row_random_process_one_block(G, steps):
+    """
+    随机处理其中一个矩阵块，其他块置零
+    """
+    result = torch.zeros_like(G)
+    rows = G.shape[0]  # 总行数
+    
+    # 随机选择一个块索引
+    block_idx = torch.randint(0, 4, (1,)).item()
+    
+    # 计算块大小
+    block_size = rows // 4
+    
+    # 处理选中的块
+    if block_idx < 3:
+        start_row = block_idx * block_size
+        end_row = (block_idx + 1) * block_size
+        block_data = G[start_row:end_row, :]
+        result[start_row:end_row, :] = process_block(block_data, steps)
+    else:
+        # 处理最后一块（可能包含剩余的行）
+        start_row = 3 * block_size
+        block_data = G[start_row:, :]
+        result[start_row:, :] = process_block(block_data, steps)
+    
+    return result
+
+def estimate_svd_weights_and_process(G, steps):
+    """
+    对原始矩阵G分块估计奇异值之和，得到权重
+    然后将权重乘到处理之后的矩阵上
+    """
+    rows = G.shape[0]  # 总行数
+    block_size = rows // 4
+    num_samples=10
+    
+    # 1. 分割原始矩阵G为4个块
+    original_blocks = []
+    for i in range(4):
+        if i < 3:
+            start_row = i * block_size
+            end_row = (i + 1) * block_size
+            block = G[start_row:end_row, :]
+        else:
+            start_row = 3 * block_size
+            block = G[start_row:, :]
+        original_blocks.append(block)
+    
+    # 2. 对原始矩阵的每个块估计奇异值之和
+    sv_estimates = []
+    for block in original_blocks:
+        sv_est = randomized_nuclear_norm_estimate_fast(block, num_samples)
+        sv_estimates.append(sv_est)
+    
+    # 3. 计算权重（每个块的奇异值之和占总和的比例）
+    sv_estimates_tensor = torch.tensor(sv_estimates, device=G.device, dtype=G.dtype)
+    # 检查奇异值之和是否为零，避免除零错误
+    if torch.sum(sv_estimates_tensor) != 0:
+        weights = sv_estimates_tensor / torch.sum(sv_estimates_tensor)
+    else:
+        weights = torch.ones_like(sv_estimates_tensor) / len(sv_estimates_tensor)
+        logger.error("警告：所有块的奇异值估计都为零，使用均匀权重")
+    
+    # 4. 再次处理每个块，但这次使用原始矩阵计算好的权重
+    result = torch.zeros_like(G)
+    for i in range(4):
+        if i < 3:
+            start_row = i * block_size
+            end_row = (i + 1) * block_size
+            # 对每个块进行正交化处理
+            processed_block = process_block(original_blocks[i], steps)
+            # 乘以原始矩阵计算得到的权重
+            weighted_block = processed_block * weights[i]
+            result[start_row:end_row, :] = weighted_block
+        else:
+            start_row = 3 * block_size
+            processed_block = process_block(original_blocks[3], steps)
+            weighted_block = processed_block * weights[3]
+            result[start_row:, :] = weighted_block
+    
+    return result
+
+def randomized_nuclear_norm_estimate_fast(A, num_samples=10):
+    """
+    快速随机估计矩阵A的奇异值之和
+    生成num_samples个随机向量，计算A*z的范数，求平均后乘以n
+    """
+    n = A.shape[1]
+    device = A.device
+    
+    # 生成随机向量
+    Z = torch.randn(n, num_samples, device=device)
+    Z = Z / torch.norm(Z, dim=0, keepdim=True)
+    
+    # 计算A*Z
+    AZ = A @ Z
+    
+    # 计算每列的范数，求平均后乘以n
+    norms = torch.norm(AZ, dim=0)
+    estimate = torch.mean(norms).item() * n
+    
+    return estimate
+
+# 谱范数归一化，分块正交之后乘以1/4
+def step_row_block_quarter(G, steps):
+    """
+    将矩阵的行分成4块，每块独立进行正交化处理
+    """
+    result = torch.zeros_like(G)
+    rows = G.shape[0]  # 总行数
+    block_size = rows // 4  # 每块的行数
+    
+    # 处理前3个完整的块
+    for i in range(3):
+        start_row = i * block_size
+        end_row = (i + 1) * block_size
+        row_block = G[start_row:end_row, :]
+        result[start_row:end_row, :] = 1/4*process_block(row_block, steps)
+    
+    # 处理最后一块（可能包含剩余的行）
+    start_row = 3 * block_size
+    last_block = G[start_row:, :]
+    result[start_row:, :] = 1/4*process_block(last_block, steps)
+    
+    return result
+
 def step_row_block(G, steps):
     """
     将矩阵的行分成4块，每块独立进行正交化处理
@@ -127,8 +254,11 @@ def step_quadrant_block(G, steps):
 
 # 实验函数配置
 STEP_MAP = {
-    "step_row_block_process_one": {"loss_threshold": 1.0, "step_func": step_row_block_process_one},
+    "estimate_svd_weights_and_process": {"loss_threshold": 1.0, "step_func": estimate_svd_weights_and_process},
     "step_func_default": {"loss_threshold": 1.0, "step_func": step_default},
+    "step_row_block_process_one": {"loss_threshold": 1.0, "step_func": step_row_block_process_one},
+    "step_row_block_quarter": {"loss_threshold": 1.0, "step_func": step_row_block_quarter},
+    "step_row_random_process_one_block": {"loss_threshold": 1.0, "step_func": step_row_random_process_one_block},
     "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
     "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
     "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_quadrant_block}
