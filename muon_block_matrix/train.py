@@ -1,5 +1,6 @@
 import torch
 import gc
+import math
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -181,10 +182,25 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         wd=experiment_config.wd
     )
     
-    num_training_steps = len(train_loader) * max_epochs
+    tokens_per_step = batch_size * max_length  # batch_size是全局batch大小
+    
+    # 计算总步数（向上取整）
+    max_tokens = experiment_config.max_tokens
+    num_training_steps = int(math.ceil(max_tokens / tokens_per_step))
+    
+    estimated_epochs = int(math.ceil(num_training_steps / len(train_loader)))
+    if rank == 0:
+        logger.info(f"📊 基于token限制计算: {max_tokens:,} tokens")
+        logger.info(f"📊 每个step处理: {tokens_per_step:,} tokens")
+        logger.info(f"📊 总训练步数: {num_training_steps:,} steps")
+        logger.info(f"📊 估计epoch数: ~{estimated_epochs} epochs")
+    
+    # 计算warmup步数
+    num_warmup_steps = num_training_steps // 20
+    
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
-        num_warmup_steps=min(100, num_training_steps // 10),
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
         num_cycles=0.5,
     )
@@ -295,12 +311,12 @@ def train_worker(rank, world_size, experiment_config):
                     })
                     epoch_pbar.update(tokens_per_batch)
                     
-                if step % 100 == 0:
+                if step % 1000 == 0:
                     progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
                     logger.info(
                         f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
                         f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"Loss: {current_loss:.4f}"
+                        f"Loss: {current_loss:.4f}, lr = {optimizer.param_groups[0]["lr"]}"
                     )
             
             if rank == 0:

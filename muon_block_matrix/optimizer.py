@@ -53,6 +53,36 @@ def step_column_block(G, steps):
     
     return result
 
+def step_row_block_process_one(G, steps):
+    """
+    将矩阵的行分成4块，每块轮流进行正交化处理
+    每次调用只处理一个小矩阵，其他块置零
+    """
+    # 初始化静态变量（函数属性）
+    if not hasattr(step_row_block_process_one, 'current_block'):
+        step_row_block_process_one.current_block = 0  # 当前要处理的块索引
+    
+    result = torch.zeros_like(G)
+    rows = G.shape[0]  # 总行数
+    block_size = rows // 4  # 每块的行数
+    
+    # 处理当前块
+    if step_row_block_process_one.current_block < 3:
+        start_row = step_row_block_process_one.current_block * block_size
+        end_row = (step_row_block_process_one.current_block + 1) * block_size
+        row_block = G[start_row:end_row, :]
+        result[start_row:end_row, :] = process_block(row_block, steps)
+    else:
+        # 处理最后一块（可能包含剩余的行）
+        start_row = 3 * block_size
+        last_block = G[start_row:, :]
+        result[start_row:, :] = process_block(last_block, steps)
+    
+    # 更新块索引，准备处理下一块
+    step_row_block_process_one.current_block = (step_row_block_process_one.current_block + 1) % 4
+    
+    return result
+
 def step_row_block(G, steps):
     """
     将矩阵的行分成4块，每块独立进行正交化处理
@@ -97,6 +127,7 @@ def step_quadrant_block(G, steps):
 
 # 实验函数配置
 STEP_MAP = {
+    "step_row_block_process_one": {"loss_threshold": 1.0, "step_func": step_row_block_process_one},
     "step_func_default": {"loss_threshold": 1.0, "step_func": step_default},
     "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
     "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
