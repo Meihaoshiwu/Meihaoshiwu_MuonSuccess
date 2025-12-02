@@ -263,22 +263,22 @@ def train_worker(rank, world_size, experiment_config):
         epoch = 0
         stop_training = False
         
+        if rank == 0:
+            epoch_pbar = tqdm(
+                total=max_tokens,
+                desc=f"Epoch {epoch+1}",
+                unit="tokens",
+                ncols=100,
+                position=0,
+                leave=True,
+            )
+
         # 外层循环改为基于epoch，内层检查token数
         while epoch < experiment_config.max_epochs and not stop_training:
             if sampler:
                 sampler.set_epoch(epoch)
                 
-            epoch_losses = []
-            
-            if rank == 0:
-                epoch_pbar = tqdm(
-                    total=max_tokens,
-                    desc=f"Epoch {epoch+1}",
-                    unit="tokens",
-                    ncols=100,
-                    position=0,
-                    leave=True,
-                )
+            recent_losses = []
             
             for step, batch in enumerate(train_loader):
                 # 检查是否达到token限制
@@ -298,7 +298,7 @@ def train_worker(rank, world_size, experiment_config):
                 lr_scheduler.step()
                 
                 current_loss = loss.item()
-                epoch_losses.append(current_loss)
+                recent_losses.append(current_loss)
                 
                 # 更新token计数
                 total_tokens_trained += tokens_per_batch
@@ -311,32 +311,22 @@ def train_worker(rank, world_size, experiment_config):
                     })
                     epoch_pbar.update(tokens_per_batch)
                     
-                if step % 1000 == 0:
+                if step % 100 == 0:
+                    avg_recent_loss = sum(recent_losses) / len(recent_losses)
                     progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
                     logger.info(
                         f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
                         f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"Loss: {current_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}"
+                        f"avg_recent_loss: {avg_recent_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}"
                     )
-            
-            if rank == 0:
-                epoch_pbar.close()
-                
-                # 计算epoch平均损失
-                if epoch_losses:  # 避免除零
-                    avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-                    losses.append(avg_epoch_loss)
-                    logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}")
-                    
-                    # 保留loss阈值检查作为备选停止条件
-                    if avg_epoch_loss < experiment_config.loss_threshold:
-                        stop_training = True
-                        logger.info(f"🎯 已达到目标损失 {avg_epoch_loss:.4f}, 停止训练")
+                    recent_losses.clear()
 
             # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
             stop_training = broadcast_stop_signal(stop_training, rank)
             
             epoch += 1
+        if rank == 0:
+            epoch_pbar.close()
         
         final_loss = losses[-1] if losses else float('inf')
         logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training},rank={rank}"
