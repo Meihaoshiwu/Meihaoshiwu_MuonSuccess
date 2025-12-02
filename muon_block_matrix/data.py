@@ -8,7 +8,7 @@ from transformers import Qwen2Tokenizer
 from loguru import logger
 from typing import List, Optional
 
-from .config import TOKENIZED_CACHE, OPENWEBTEXT_EXTRACTED, DATASET_CACHE
+from .config import TOKENIZED_CACHE, DATA_EXTRACTED_DIR, DATASET_CACHE
 
 def load_dataset_by_name(dataset_name: str):
     """加载数据集函数"""
@@ -33,9 +33,10 @@ def load_dataset_by_name(dataset_name: str):
         )
 
     elif dataset_name == "openwebtext-local_txt":
+        output_dir = os.path.join(DATA_EXTRACTED_DIR, "openwebtext")
         dataset = load_dataset(
             "text",
-            data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt",
+            data_files=f"{output_dir}/*.txt",
             streaming=True,
             cache_dir=DATASET_CACHE,
             trust_remote_code=True,

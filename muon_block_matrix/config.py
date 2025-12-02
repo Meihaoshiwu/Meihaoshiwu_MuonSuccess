@@ -7,7 +7,7 @@ MODEL_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Models")
 DATASET_PATH = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Datasets") 
 TOKENIZED_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "TokenizedData")
 RESULTS_BASE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Results")
-OPENWEBTEXT_EXTRACTED = os.path.join(DATASET_PATH, "openwebtext_extracted")
+DATA_EXTRACTED_DIR = os.path.join(DATASET_PATH, "extracted_data")
 DATASET_CACHE = os.path.join(DATASET_PATH, "cache")
 DATASET_DOWNLOAD = os.path.join(DATASET_PATH, "download")
 
