@@ -37,7 +37,6 @@ def load_dataset_by_name(dataset_name: str):
         dataset = load_dataset(
             "text",
             data_files=f"{output_dir}/*.txt",
-            streaming=True,
             cache_dir=DATASET_CACHE,
             trust_remote_code=True,
         )
@@ -71,7 +70,7 @@ class ExperimentPreparer:
         self.tokenizer_name = tokenizer_name
         self.model_cache_dir = model_cache_dir
         self.output_file = output_file
-        self.num_workers = min(mp.cpu_count(), 4)
+        self.num_workers = min(mp.cpu_count(), 32)
         self.batch_size = batch_size
 
     @staticmethod
