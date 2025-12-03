@@ -19,8 +19,8 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int):
     if G.size(0) > G.size(1):
         X = X.T
     return X
-
-def step_default(G, steps):
+# matrix_block_num在这里没用，只是为了保持回调函数一致性
+def step_default(G, steps, matrix_block_num):
     return zeropower_via_newtonschulz5(G, steps)
 
 def process_block(blocked_matrix, steps):
@@ -30,105 +30,198 @@ def process_block(blocked_matrix, steps):
     else:
         return blocked_matrix
 
-def step_column_block(G, steps):
+def step_column_block(G, steps, matrix_block_num: int):
     """
-    将矩阵的列分成4块，每块独立进行正交化处理
+    将矩阵的列分成matrix_block_num块，每块独立进行正交化处理
     """
     result = torch.zeros_like(G) # 用于保存结果
     cols = G.shape[1]  # 总列数
-    block_size = cols // 4  # 每块的列数
     
-    # 处理前3个完整的块
-    for i in range(3):
+    # 检查是否支持这么多分块
+    if matrix_block_num > cols:
+        logger.info(f"Warning: 矩阵只有{cols}列，但要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps)
+    
+    block_size = cols // matrix_block_num  # 每块的列数
+
+    for i in range(matrix_block_num-1):
         start_col = i * block_size
         end_col = (i + 1) * block_size
         column_block = G[:, start_col:end_col] # 取所有行，[start_col,end_col)列
-
         result[:, start_col:end_col] = process_block(column_block, steps)
     
     # 处理最后一块（可能包含剩余的列）
-    start_col = 3 * block_size
+    start_col = (matrix_block_num-1) * block_size
     last_block = G[:, start_col:]
     result[:, start_col:] = process_block(last_block, steps)
     
     return result
 
-def step_row_block_process_one(G, steps):
+def step_row_block(G, steps, matrix_block_num: int):
     """
-    将矩阵的行分成4块，每块轮流进行正交化处理
-    每次调用只处理一个小矩阵，其他块置零
+    将矩阵的行分成matrix_block_num块，每块独立进行正交化处理
     """
+    result = torch.zeros_like(G)
+    rows = G.shape[0]  # 总行数
+    
+    # 检查是否支持这么多分块
+    if matrix_block_num > rows:
+        logger.info(f"Warning: 矩阵只有{rows}行，但要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps)
+    
+    block_size = rows // matrix_block_num  # 每块的行数
+    
+    # 处理前row_num-1个完整的块
+    for i in range(matrix_block_num-1):
+        start_row = i * block_size
+        end_row = (i + 1) * block_size
+        row_block = G[start_row:end_row, :]
+        result[start_row:end_row, :] = process_block(row_block, steps)
+    
+    # 处理最后一块（可能包含剩余的行）
+    start_row = (matrix_block_num-1) * block_size
+    last_block = G[start_row:, :]
+    result[start_row:, :] = process_block(last_block, steps)
+    
+    return result
+
+# 横纵都切分
+def step_block_matrix_flexible(G, steps, matrix_block_num: int):
+    """
+    更灵活的分块函数，可以处理非平方数的分块数
+    例如：block_num=12 -> 可能会分成3x4或4x3等
+    """
+    result = torch.zeros_like(G)
+    rows, cols = G.shape
+    
+    # 寻找最接近平方根的两个因数
+    row_blocks, col_blocks = -1, -1
+    sqrt_block = int(math.sqrt(matrix_block_num))
+    for i in range(sqrt_block, 1, -1): # 至少不退化到列分块
+        if matrix_block_num % i == 0:
+            row_blocks, col_blocks = i, matrix_block_num // i
+            break
+    
+    if row_blocks < 0:
+        logger.info(f"Warning: 无法将{matrix_block_num}分解为合适的因数，将作为整体处理")
+        return process_block(G, steps)
+
+    if rows // row_blocks < 1 or cols // col_blocks < 1:
+        logger.info(f"Warning: 分块后某些块没有元素，将作为整体处理")
+        return process_block(G, steps)
+    
+    row_block_size = rows // row_blocks
+    col_block_size = cols // col_blocks
+    
+    for i in range(row_blocks):
+        for j in range(col_blocks):
+            # 计算当前块的行范围
+            start_row = i * row_block_size
+            end_row = (i + 1) * row_block_size if i < row_blocks - 1 else rows
+            
+            # 计算当前块的列范围
+            start_col = j * col_block_size
+            end_col = (j + 1) * col_block_size if j < col_blocks - 1 else cols
+            
+            # 处理当前块
+            block = G[start_row:end_row, start_col:end_col]
+            result[start_row:end_row, start_col:end_col] = process_block(block, steps)
+    
+    return result
+
+# 轮流处理某一个分块,其他块置零
+def step_row_block_process_one(G, steps, matrix_block_num: int):
+    """
+    将矩阵的行分成matrix_block_num块，每块独立进行正交化处理
+    """
+    rows = G.shape[0]  # 总行数
+    
+    # 矩阵太小没必要分块
+    if matrix_block_num*matrix_block_num > rows:
+        logger.info(f"Warning: 矩阵{rows}行，要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps)
+
     # 初始化静态变量（函数属性）
     if not hasattr(step_row_block_process_one, 'current_block'):
         step_row_block_process_one.current_block = 0  # 当前要处理的块索引
-    
+
     result = torch.zeros_like(G)
-    rows = G.shape[0]  # 总行数
-    block_size = rows // 4  # 每块的行数
     
-    # 处理当前块
-    if step_row_block_process_one.current_block < 3:
+    block_size = rows // matrix_block_num  # 每块的行数
+
+    if step_row_block_process_one.current_block < matrix_block_num-1:
         start_row = step_row_block_process_one.current_block * block_size
         end_row = (step_row_block_process_one.current_block + 1) * block_size
         row_block = G[start_row:end_row, :]
         result[start_row:end_row, :] = process_block(row_block, steps)
     else:
         # 处理最后一块（可能包含剩余的行）
-        start_row = 3 * block_size
+        start_row = (matrix_block_num-1) * block_size
         last_block = G[start_row:, :]
         result[start_row:, :] = process_block(last_block, steps)
     
     # 更新块索引，准备处理下一块
-    step_row_block_process_one.current_block = (step_row_block_process_one.current_block + 1) % 4
+    step_row_block_process_one.current_block = (step_row_block_process_one.current_block + 1) % matrix_block_num
     
     return result
 
 # 随机处理其中某一个矩阵
-def step_row_random_process_one_block(G, steps):
+def step_row_random_process_one_block(G, steps, matrix_block_num: int):
     """
     随机处理其中一个矩阵块，其他块置零
     """
-    result = torch.zeros_like(G)
     rows = G.shape[0]  # 总行数
     
+    # 矩阵太小没必要分块
+    if matrix_block_num*matrix_block_num > rows:
+        logger.info(f"Warning: 矩阵{rows}行，要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps)
+
+    result = torch.zeros_like(G)
+    
     # 随机选择一个块索引
-    block_idx = torch.randint(0, 4, (1,)).item()
+    block_idx = torch.randint(0, matrix_block_num, (1,)).item()
     
     # 计算块大小
-    block_size = rows // 4
+    block_size = rows // matrix_block_num  # 每块的行数
     
     # 处理选中的块
-    if block_idx < 3:
+    if block_idx < matrix_block_num-1:
         start_row = block_idx * block_size
         end_row = (block_idx + 1) * block_size
         block_data = G[start_row:end_row, :]
         result[start_row:end_row, :] = process_block(block_data, steps)
     else:
         # 处理最后一块（可能包含剩余的行）
-        start_row = 3 * block_size
+        start_row = (matrix_block_num-1) * block_size
         block_data = G[start_row:, :]
         result[start_row:, :] = process_block(block_data, steps)
     
     return result
 
-def estimate_svd_weights_and_process(G, steps):
+def estimate_svd_weights_and_process(G, steps, matrix_block_num: int):
     """
     对原始矩阵G分块估计奇异值之和，得到权重
     然后将权重乘到处理之后的矩阵上
     """
     rows = G.shape[0]  # 总行数
-    block_size = rows // 4
-    num_samples=10
     
-    # 1. 分割原始矩阵G为4个块
+    # 矩阵太小没必要分块
+    if matrix_block_num*matrix_block_num > rows:
+        logger.info(f"Warning: 矩阵{rows}行，要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps)
+
+    block_size = rows // matrix_block_num
+    num_samples=20
+
     original_blocks = []
-    for i in range(4):
-        if i < 3:
+    for i in range(matrix_block_num):
+        if i < matrix_block_num-1:
             start_row = i * block_size
             end_row = (i + 1) * block_size
             block = G[start_row:end_row, :]
         else:
-            start_row = 3 * block_size
+            start_row = (matrix_block_num-1) * block_size
             block = G[start_row:, :]
         original_blocks.append(block)
     
@@ -149,8 +242,8 @@ def estimate_svd_weights_and_process(G, steps):
     
     # 4. 再次处理每个块，但这次使用原始矩阵计算好的权重
     result = torch.zeros_like(G)
-    for i in range(4):
-        if i < 3:
+    for i in range(matrix_block_num):
+        if i < matrix_block_num-1:
             start_row = i * block_size
             end_row = (i + 1) * block_size
             # 对每个块进行正交化处理
@@ -159,9 +252,9 @@ def estimate_svd_weights_and_process(G, steps):
             weighted_block = processed_block * weights[i]
             result[start_row:end_row, :] = weighted_block
         else:
-            start_row = 3 * block_size
-            processed_block = process_block(original_blocks[3], steps)
-            weighted_block = processed_block * weights[3]
+            start_row = (matrix_block_num-1) * block_size
+            processed_block = process_block(original_blocks[matrix_block_num-1], steps)
+            weighted_block = processed_block * weights[matrix_block_num-1]
             result[start_row:, :] = weighted_block
     
     return result
@@ -210,48 +303,6 @@ def step_row_block_quarter(G, steps):
     
     return result
 
-def step_row_block(G, steps):
-    """
-    将矩阵的行分成4块，每块独立进行正交化处理
-    """
-    result = torch.zeros_like(G)
-    rows = G.shape[0]  # 总行数
-    block_size = rows // 4  # 每块的行数
-    
-    # 处理前3个完整的块
-    for i in range(3):
-        start_row = i * block_size
-        end_row = (i + 1) * block_size
-        row_block = G[start_row:end_row, :]
-        result[start_row:end_row, :] = process_block(row_block, steps)
-    
-    # 处理最后一块（可能包含剩余的行）
-    start_row = 3 * block_size
-    last_block = G[start_row:, :]
-    result[start_row:, :] = process_block(last_block, steps)
-    
-    return result
-
-def step_quadrant_block(G, steps):
-    """
-    将矩阵分成2x2的分成四块
-    """
-    result = torch.zeros_like(G)
-    
-    rowidx = G.shape[0]//2
-    colidx = G.shape[1]//2
-
-    G11 = G[:rowidx, :colidx]
-    result[:rowidx, :colidx] = process_block(G11, steps)
-    G12 = G[:rowidx, colidx:]
-    result[:rowidx, colidx:] = process_block(G12, steps)
-    G21 = G[rowidx:, :colidx]
-    result[rowidx:, :colidx] = process_block(G21, steps)
-    G22 = G[rowidx:, colidx:]
-    result[rowidx:, colidx:] = process_block(G22, steps)
-    
-    return result
-
 # 实验函数配置
 STEP_MAP = {
     "estimate_svd_weights_and_process": {"loss_threshold": 1.0, "step_func": estimate_svd_weights_and_process},
@@ -261,9 +312,10 @@ STEP_MAP = {
     "step_row_block_quarter": {"loss_threshold": 1.0, "step_func": step_row_block_quarter},
     "step_row_random_process_one_block": {"loss_threshold": 1.0, "step_func": step_row_random_process_one_block},
     "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
-    "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_quadrant_block}
+    "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_block_matrix_flexible}
 }
 
+MATRIX_BLOCK_NUM=16
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -303,6 +355,7 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.95, 0.9),
         adamw_eps=1e-8,
+        matrix_block_num=MATRIX_BLOCK_NUM
     ):
 
         defaults = dict(
@@ -316,6 +369,7 @@ class Muon(torch.optim.Optimizer):
         )
 
         self.step_func = step_func
+        self.matrix_block_num=matrix_block_num
         params = list(muon_params)
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params.extend(adamw_params)
@@ -381,7 +435,7 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = self.step_func(g, steps=group["ns_steps"])
+                u = self.step_func(g, steps=group["ns_steps"], matrix_block_num=self.matrix_block_num)
 
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
