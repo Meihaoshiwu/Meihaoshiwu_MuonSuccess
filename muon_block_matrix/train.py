@@ -1,6 +1,6 @@
 import torch
 import gc
-import math
+import math, time
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -108,7 +108,7 @@ class ExperimentResources:
         self.sampler = sampler
         self.rank = rank
         self.world_size = world_size
-
+MATRIX_BLOCK_NUM=16
 @contextmanager
 def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1):
     """管理GPU、数据集、模型资源,管理日志打印"""
@@ -140,6 +140,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     
     # 打印工作进程初始化成功日志
     if world_size > 1:
+        logger.info(f"Rank {rank}/{world_size} 开始初始化DDP")
         setup_ddp(rank, world_size)
         logger.info(f"🎯 Rank {rank}/{world_size} 初始化完成")
         logger.info(f"🖥️  当前GPU: {torch.cuda.current_device()}")
@@ -161,8 +162,8 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     # 只在主进程显示启动信息
     if rank == 0:
         logger.info(f"🚀 开始实验: {optimizer_name}_{step_func_name}")
-        logger.info(f"目标损失阈值: {loss_threshold}, 最大epoch数: {max_epochs}, 总参数量: {total_params}")
-        logger.info(f"max_position_embeddings: {max_position_embeddings}, max_length: {max_length}")
+        logger.info(f"目标损失阈值: {loss_threshold}, 总参数量: {total_params}")
+        logger.info(f"矩阵分块数量 {MATRIX_BLOCK_NUM}")
         logger.info(f"使用DDP训练, 检测到 {world_size} 个GPU")
     
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
@@ -179,7 +180,8 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         optimizer_name=optimizer_name, 
         model=original_model,
         lr=lr, 
-        wd=experiment_config.wd
+        wd=experiment_config.wd,
+        matrix_block_num=MATRIX_BLOCK_NUM
     )
     
     tokens_per_step = batch_size * max_length  # batch_size是全局batch大小
@@ -239,6 +241,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
             logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
+LOG_INTERVAL = 200
 def train_worker(rank, world_size, experiment_config):
     """DDP训练工作进程"""
     with experiment_manager(experiment_config, rank, world_size) as resources:
@@ -248,7 +251,6 @@ def train_worker(rank, world_size, experiment_config):
         device = resources.device
         lr_scheduler = resources.lr_scheduler
         sampler = resources.sampler
-        step_func_name = experiment_config.step_func_name
         
         model.train()
         losses = []
@@ -266,19 +268,25 @@ def train_worker(rank, world_size, experiment_config):
         if rank == 0:
             epoch_pbar = tqdm(
                 total=max_tokens,
-                desc=f"Epoch {epoch+1}",
                 unit="tokens",
                 ncols=100,
                 position=0,
                 leave=True,
             )
 
+        avg_recent_loss = 0
+        recent_losses = []
         # 外层循环改为基于epoch，内层检查token数
         while epoch < experiment_config.max_epochs and not stop_training:
             if sampler:
                 sampler.set_epoch(epoch)
-                
-            recent_losses = []
+
+            recent_process_block_time = []
+            recent_estimate_block_time = []
+            recent_optimizer_time = []
+            
+            logger.info(
+                f"Start Epoch: {epoch}!")
             
             for step, batch in enumerate(train_loader):
                 # 检查是否达到token限制
@@ -294,7 +302,13 @@ def train_worker(rank, world_size, experiment_config):
                 loss = outputs.loss
                 
                 loss.backward()
-                optimizer.step()
+                optimizer_start = time.time()
+                _, process_block_time, estimate_block_time = optimizer.step()
+                optimizer_end = time.time()
+                optimizer_time = optimizer_end-optimizer_start
+                recent_process_block_time.append(process_block_time)
+                recent_estimate_block_time.append(estimate_block_time)
+                recent_optimizer_time.append(optimizer_time)
                 lr_scheduler.step()
                 
                 current_loss = loss.item()
@@ -305,21 +319,33 @@ def train_worker(rank, world_size, experiment_config):
                 
                 if rank == 0:
                     epoch_pbar.set_postfix({
+                        'Epoch': f'{epoch}',
                         'loss': f'{current_loss:.4f}',
                         'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
                         'lr': f'{optimizer.param_groups[0]["lr"]:.5e}'
                     })
                     epoch_pbar.update(tokens_per_batch)
                     
-                if step % 100 == 0:
+                if step % LOG_INTERVAL == 0:
                     avg_recent_loss = sum(recent_losses) / len(recent_losses)
+                    avg_recent_process_block_time = sum(recent_process_block_time) / len(recent_process_block_time)
+                    avg_recent_estimate_block_time = sum(recent_estimate_block_time) / len(recent_estimate_block_time)
+                    avg_recent_optimizer_time = sum(recent_optimizer_time) / len(recent_optimizer_time)
                     progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
                     logger.info(
-                        f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Rank: {rank}"
                         f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"avg_recent_loss: {avg_recent_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}"
+                        f"avg_recent_loss: {avg_recent_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}")
+                    logger.info(f"avg_process_block_time: {avg_recent_process_block_time:.4f}s,"
+                        f"avg_recent_estimate_block_time: {avg_recent_estimate_block_time:.4f}s,"
+                        f"avg_recent_optimizer_time: {avg_recent_optimizer_time:.4f}s."
                     )
+                    recent_process_block_time.clear()
+                    recent_estimate_block_time.clear()
+                    recent_optimizer_time.clear()
                     recent_losses.clear()
+                    if (avg_recent_loss < experiment_config.loss_threshold):
+                        stop_training = True
+                        break;
 
             # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
             stop_training = broadcast_stop_signal(stop_training, rank)
@@ -327,11 +353,10 @@ def train_worker(rank, world_size, experiment_config):
             epoch += 1
         if rank == 0:
             epoch_pbar.close()
-        
-        final_loss = losses[-1] if losses else float('inf')
-        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training},rank={rank}"
-                    " final_loss: {final_loss:.4f}, avg_epoch_loss = {avg_epoch_loss}")
-        return final_loss, losses
+
+        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, rank={rank}"
+                    "avg_recent_loss = {avg_recent_loss}")
+        return
 
 def run_experiment(experiment_config: ExperimentConfig):
     """运行单个实验，支持DDP"""
@@ -345,7 +370,8 @@ def run_experiment(experiment_config: ExperimentConfig):
             nprocs=world_size,
             join=True
         )
-        return None, None
+        return
     else:
         # 单GPU直接调用训练函数
-        return train_worker(0, 1, experiment_config)
+        train_worker(0, 1, experiment_config)
+        return

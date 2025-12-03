@@ -1,17 +1,16 @@
 # preprocess.py
 import os
+import glob
+import hashlib
 from .data import ExperimentPreparer, load_dataset_by_name
 from .config import TOKENIZED_CACHE, DATASET_CACHE, MODEL_CACHE, DATA_EXTRACTED_DIR
+import torch.multiprocessing as mp
 
 def create_sharded_directories(input_dir, num_shards=32):
     """
     将输入目录的文件分配到多个分片目录（创建符号链接）
     返回分片目录列表
     """
-    import os
-    import glob
-    import hashlib
-    
     # 获取所有txt文件
     all_files = glob.glob(os.path.join(input_dir, "*.txt"))
     print(f"📁 找到 {len(all_files)} 个txt文件")
@@ -97,17 +96,18 @@ def preprocess_dataset(dataset_name: str, tokenizer_name: str = "Qwen/Qwen2.5-0.
         print("🔧 使用分片目录方案处理 openwebtext-local_txt")
         
         # 1. 创建分片目录
-        num_shards = 32  # 根据CPU核心数调整
+        num_shards =min(mp.cpu_count(), 32)
         shard_dirs = create_sharded_directories(output_dir, num_shards=num_shards)
         
         try:
             # 2. 创建preparer，传入分片目录
             preparer = ExperimentPreparer(
                 texts=[],  # 传递空列表，因为使用分片目录
+                num_workers=num_shards,
                 tokenizer_name=tokenizer_name,
                 model_cache_dir=MODEL_CACHE,
                 output_file=output_file,
-                batch_size=64,  # 可以调整
+                batch_size=1000,  # 可以调整
                 shard_dirs=shard_dirs,  # 传递分片目录
             )
             
