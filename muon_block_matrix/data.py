@@ -93,7 +93,7 @@ class ExperimentPreparer:
             print(f"✅ 已下载到缓存: {cache_dir}")
 
         all_tokens = []
-        for text_batch in text_batches:
+        for batch_idx, text_batch in enumerate(text_batches):
             encoded = tokenizer.batch_encode_plus(
                 text_batch,
                 add_special_tokens=True,
@@ -105,6 +105,12 @@ class ExperimentPreparer:
             )["input_ids"]
             for seq in encoded:
                 all_tokens.extend(seq)
+            # 每处理完一批就打印进度
+            files_in_this_batch = len(text_batch)
+            total_files_processed += files_in_this_batch
+            print(f"进程 {worker_id}: 批次 {batch_idx+1}/{len(text_batches)} "
+                f"处理了 {files_in_this_batch} 个文件，"
+                f"累计 {total_files_processed} 个文件")
         return worker_id, all_tokens, len(text_batches)
 
     @staticmethod
@@ -157,11 +163,13 @@ class ExperimentPreparer:
         # 2. 并行 tokenize
         results = []
         with mp.Pool(self.num_workers) as pool:
-            for wid, tokens, _ in pool.imap_unordered(
+            for wid, tokens, batch_count, file_count in pool.imap_unordered(
                 self._tokenize_worker, worker_inputs
             ):
                 torch.save({"tokens": tokens}, os.path.join(partial_dir, f"worker_{wid}.pt"))
-                results.append((wid, len(tokens)))
+                results.append((wid, len(tokens), file_count))
+                print(f"✅ 进程 {wid} 完成: 处理了 {batch_count} 个批次，"
+                    f"共 {file_count} 个文件，生成 {len(tokens)} 个token")
 
         # 3. 合并 & 清理
         all_tokens = self._merge_and_save(partial_dir, self.num_workers, self.output_file)

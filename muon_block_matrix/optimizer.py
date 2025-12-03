@@ -256,11 +256,11 @@ def step_quadrant_block(G, steps):
 STEP_MAP = {
     "estimate_svd_weights_and_process": {"loss_threshold": 1.0, "step_func": estimate_svd_weights_and_process},
     "step_func_default": {"loss_threshold": 1.0, "step_func": step_default},
+    "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
     "step_row_block_process_one": {"loss_threshold": 1.0, "step_func": step_row_block_process_one},
     "step_row_block_quarter": {"loss_threshold": 1.0, "step_func": step_row_block_quarter},
     "step_row_random_process_one_block": {"loss_threshold": 1.0, "step_func": step_row_random_process_one_block},
     "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
-    "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
     "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_quadrant_block}
 }
 
