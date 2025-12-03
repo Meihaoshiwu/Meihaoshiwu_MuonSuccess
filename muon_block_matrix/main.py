@@ -53,28 +53,16 @@ def main():
     print(f"使用模型缓存: {MODEL_CACHE}")
     print(f"使用数据集缓存: {DATASET_CACHE}")
     print(f"使用分词缓存: {TOKENIZED_CACHE}")
-    
-    results = {}
-    for i, (func_name, config_dict) in enumerate(STEP_MAP.items()):
+
+    for _, (func_name, config_dict) in enumerate(STEP_MAP.items()):
         # 运行实验
         experiment_config.step_func_name = func_name
         experiment_config.step_func = config_dict.get("step_func")
-        final_loss, all_losses = run_experiment(experiment_config)
-        
-        # 保存结果
-        # results[func_name] = {
-        #     'final_loss': final_loss,
-        #     'all_losses': all_losses,
-        #     'converged': final_loss < experiment_config.loss_threshold
-        # }
+        run_experiment(experiment_config)
         
         # 为下一个实验等待一下，确保资源释放
         import time
         time.sleep(5)
-    
-    # for exp_name, result in results.items():
-    #     status = "✅ 收敛" if result['converged'] else "❌ 未收敛"
-    #     print(f"{exp_name}: 最终损失 = {result['final_loss']:.4f} {status}")
 
 if __name__ == "__main__":
     main()

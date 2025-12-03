@@ -2,7 +2,13 @@ import os
 from loguru import logger
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-def create_qwen_model(model_name, hidden_size, max_position_embeddings=2048):
+def record_model_config(model_name, config):
+    logger.info(f"记录模型配置: model_name = {model_name}")
+    logger.info(f"hidden_size = {config.hidden_size}, intermediate_size = {config.intermediate_size}")
+    logger.info(f"max_position_embeddings = {config.max_position_embeddings}, num_hidden_layers = {config.num_hidden_layers}")
+    logger.info(f"num_key_value_heads = {config.num_key_value_heads}, num_attention_heads = {config.num_attention_heads}")
+
+def create_qwen_model(model_name, rank, hidden_size, max_position_embeddings=2048):
     if model_name == "qwen":
         config = Qwen2Config(
             attention_dropout=0.0,
@@ -55,4 +61,6 @@ def create_qwen_model(model_name, hidden_size, max_position_embeddings=2048):
         )
     else:
         assert 0, f"model {model_name} not supported"
+    if rank == 0:
+        record_model_config(model_name, config)
     return Qwen2ForCausalLM(config)
