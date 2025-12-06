@@ -13,8 +13,8 @@ from contextlib import contextmanager
 from tqdm import tqdm
 
 from .config import *
-from .model import create_qwen_model
-from .data import MoonDataset, load_dataset
+from .model import create_model
+from .data import MoonDataset, MMapDataset
 from .optimizer import get_optimizer, STEP_MAP
 
 # -------------- 工具函数 --------------
@@ -80,8 +80,9 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
     logger.info(f"Training with {world_size} GPU(s), rank {rank}")
 
     # 创建模型
-    model = create_qwen_model(
+    model = create_model(
         model_name=model_name,
+        rank=rank,
         hidden_size=hidden_size,
         max_position_embeddings=max_position_embeddings
     )
@@ -119,7 +120,6 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     lr = experiment_config.lr
     model_name = experiment_config.model_name
     dataset_name = experiment_config.dataset_name
-    max_epochs = experiment_config.max_epochs
     max_position_embeddings = experiment_config.max_position_embeddings
     max_length = experiment_config.max_length
     batch_size = experiment_config.batch_size
@@ -129,7 +129,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     logger.remove()
     if rank == 0:
         sink_id = logger.add(
-            f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", 
+            f"{log_file_path}/{timestamp}_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", 
             mode="w", level="INFO"
         )
     else:
@@ -147,7 +147,7 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
         logger.info(f"🌐 进程组: {dist.get_world_size()} 个进程")
 
     # 初始化所有资源
-    model, train_loader, sampler = get_model_and_dataloader(
+    model, train_loader, sampler = get_model_and_dataloader_mmap(
         model_name=model_name,
         dataset_name=dataset_name,
         hidden_size=experiment_config.hidden_size,
@@ -177,11 +177,11 @@ def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1
     original_model = model.module if world_size > 1 else model
     optimizer = get_optimizer(
         step_func=STEP_MAP[step_func_name]["step_func"],
+        matrix_block_num=MATRIX_BLOCK_NUM,
         optimizer_name=optimizer_name, 
         model=original_model,
         lr=lr, 
         wd=experiment_config.wd,
-        matrix_block_num=MATRIX_BLOCK_NUM
     )
     
     tokens_per_step = batch_size * max_length  # batch_size是全局batch大小
@@ -253,7 +253,6 @@ def train_worker(rank, world_size, experiment_config):
         sampler = resources.sampler
         
         model.train()
-        losses = []
         total_tokens_trained = 0
         batch_size = experiment_config.batch_size # 这是全量的batch大小
         max_length = experiment_config.max_length
@@ -284,17 +283,14 @@ def train_worker(rank, world_size, experiment_config):
             recent_process_block_time = []
             recent_estimate_block_time = []
             recent_optimizer_time = []
+            recent_step_time = []
             
             logger.info(
                 f"Start Epoch: {epoch}!")
             
             for step, batch in enumerate(train_loader):
                 # 检查是否达到token限制
-                if total_tokens_trained >= max_tokens:
-                    logger.info(f"🎯 已达到目标token数 {max_tokens}, 停止训练")
-                    stop_training = True
-                    break
-                
+                step_start = time.time()
                 optimizer.zero_grad()
                 batch = batch.to(device)
                 input_ids = batch
@@ -316,46 +312,52 @@ def train_worker(rank, world_size, experiment_config):
                 
                 # 更新token计数
                 total_tokens_trained += tokens_per_batch
+                step_end = time.time()
+                recent_step_time.append(step_end-step_start)
                 
                 if rank == 0:
                     epoch_pbar.set_postfix({
                         'Epoch': f'{epoch}',
-                        'loss': f'{current_loss:.4f}',
+                        'loss': f'{current_loss:.2f}',
                         'progress': f'{total_tokens_trained/max_tokens*100:.1f}%' if max_tokens != float('inf') else 'N/A',
-                        'lr': f'{optimizer.param_groups[0]["lr"]:.5e}'
                     })
                     epoch_pbar.update(tokens_per_batch)
                     
-                if step % LOG_INTERVAL == 0:
+                if step != 0 and step % LOG_INTERVAL == 0:
                     avg_recent_loss = sum(recent_losses) / len(recent_losses)
                     avg_recent_process_block_time = sum(recent_process_block_time) / len(recent_process_block_time)
                     avg_recent_estimate_block_time = sum(recent_estimate_block_time) / len(recent_estimate_block_time)
                     avg_recent_optimizer_time = sum(recent_optimizer_time) / len(recent_optimizer_time)
+                    avg_recent_step_time = sum(recent_step_time) / len(recent_step_time)
                     progress_pct = total_tokens_trained/max_tokens*100 if max_tokens != float('inf') else 0
                     logger.info(
-                        f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) "
-                        f"avg_recent_loss: {avg_recent_loss:.4f}, lr: {optimizer.param_groups[0]['lr']:.5e}")
-                    logger.info(f"avg_process_block_time: {avg_recent_process_block_time:.4f}s,"
-                        f"avg_recent_estimate_block_time: {avg_recent_estimate_block_time:.4f}s,"
-                        f"avg_recent_optimizer_time: {avg_recent_optimizer_time:.4f}s."
-                    )
+                        f"Tokens: {total_tokens_trained}/{max_tokens} ({progress_pct:.1f}%) Step = {step}, "
+                        f"avg_recent_loss: {avg_recent_loss:.2f}, lr: {optimizer.param_groups[0]['lr']:.2e}.")
+                    logger.info(f"avg_process_block_time: {avg_recent_process_block_time:.2f}s, "
+                        f"avg_recent_estimate_block_time: {avg_recent_estimate_block_time:.2f}s, ")
+                    logger.info(f"avg_recent_optimizer_time: {avg_recent_optimizer_time:.2f}s, "
+                        f"avg_recent_step_time: {avg_recent_step_time:.2f}s.")
                     recent_process_block_time.clear()
                     recent_estimate_block_time.clear()
                     recent_optimizer_time.clear()
                     recent_losses.clear()
-                    if (avg_recent_loss < experiment_config.loss_threshold):
+                    if rank == 0 and total_tokens_trained >= max_tokens:
+                        logger.info(f"🎯 已达到目标token数 {max_tokens}, 停止训练")
                         stop_training = True
-                        break;
-
-            # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
-            stop_training = broadcast_stop_signal(stop_training, rank)
+                    # 检查主进程已经达到停止条件,src=0指定了使用主进程的stop向量
+                    if rank == 0 and (avg_recent_loss < experiment_config.loss_threshold):
+                        logger.info(f"🎯 已达到损失阈值数 {experiment_config.loss_threshold}, 停止训练")
+                        stop_training = True
+                    stop_training = broadcast_stop_signal(stop_training, rank)
+                    if stop_training:
+                        break
             
             epoch += 1
         if rank == 0:
             epoch_pbar.close()
 
-        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, rank={rank}"
-                    "avg_recent_loss = {avg_recent_loss}")
+        logger.info(f"训练结束。总token数: {total_tokens_trained:,}, stop_training={stop_training}, rank={rank}, "
+                    f"avg_recent_loss = {avg_recent_loss}")
         return
 
 def run_experiment(experiment_config: ExperimentConfig):
@@ -375,3 +377,83 @@ def run_experiment(experiment_config: ExperimentConfig):
         # 单GPU直接调用训练函数
         train_worker(0, 1, experiment_config)
         return
+
+def construct_tokenized_filename(dataset_name: str, model_name: str = None):
+    # 提取模型前缀
+    model_prefix = ""
+    if model_name:
+        model_lower = model_name.lower()
+        if model_lower.startswith("qwen"):
+            model_prefix = "qwen"
+        elif model_lower.startswith("llama"):
+            model_prefix = "llama-7b"
+    
+    # 构造文件名
+    if model_prefix:
+        filename = f"{dataset_name}_{model_prefix}.bin"
+    else:
+        filename = f"{dataset_name}.bin"
+    
+    # 构建完整路径
+    file_path = os.path.join(TOKENIZED_CACHE, filename)
+    
+    logger.info(f"📂 使用tokenized文件: {file_path}")
+    
+    return file_path
+
+def get_model_and_dataloader_mmap(model_name, dataset_name, hidden_size, 
+                                 max_position_embeddings=2048, max_length=1024, 
+                                 per_gpu_batch_size=32, rank=0, world_size=1,):
+    logger.info("🚀 使用内存映射数据集模式")
+    logger.info(f"  模型: {model_name}, 数据集: {dataset_name}")
+    logger.info(f"  序列长度: {max_length}, 批次大小: {per_gpu_batch_size}")
+    
+    # 1. 构造tokenized文件路径
+    tokenized_file_path = construct_tokenized_filename(
+        dataset_name=dataset_name,
+        model_name=model_name,
+    )
+
+    train_dataset = MMapDataset(
+        file_path=tokenized_file_path,
+        max_length=max_length
+    )
+
+    sampler = None
+    if world_size > 1:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        logger.info(f"  分布式采样器: world_size={world_size}, rank={rank}")
+
+    num_workers = min(2, mp.cpu_count() // world_size)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=per_gpu_batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=True
+    )
+    
+    logger.info(f"  DataLoader: {num_workers} workers, batch_size={per_gpu_batch_size}")
+
+    model = create_model(
+        model_name=model_name,
+        rank=rank,
+        hidden_size=hidden_size,
+        max_position_embeddings=max_position_embeddings
+    )
+
+    if rank == 0:
+        logger.info("✅ 内存映射数据集初始化完成")
+        logger.info(f"  每个epoch批次数: {len(train_loader)}")
+    
+    return model, train_loader, sampler

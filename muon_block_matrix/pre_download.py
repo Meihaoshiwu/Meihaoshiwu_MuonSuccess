@@ -225,84 +225,6 @@ def check_network_connection():
     except:
         return False
 
-import torch
-import time
-import sys
-
-def torch_matrix_multiplication_loop(device='cuda', size=1000):
-    """
-    使用PyTorch的无限循环矩阵乘法
-    
-    Args:
-        device: 'cuda' 或 'cpu'
-        size: 矩阵大小
-    """
-    # 检查设备可用性
-    if device == 'cuda':
-        if not torch.cuda.is_available():
-            print("CUDA不可用，回退到CPU")
-            device = 'cpu'
-        else:
-            print(f"使用GPU: {torch.cuda.get_device_name(0)}")
-    
-    device = torch.device(device)
-    
-    # 预分配张量
-    matrix_a = torch.empty(size, size, device=device)
-    matrix_b = torch.empty(size, size, device=device)
-    
-    iteration = 0
-    total_operations = 0
-    start_time = time.time()
-    
-    try:
-        while True:
-            iteration += 1
-            
-            # 生成随机矩阵
-            matrix_a.normal_()
-            matrix_b.normal_()
-            
-            # 执行乘法
-            torch.mm(matrix_a, matrix_b)
-            
-            # 如果是CUDA，需要同步等待计算完成
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            
-            # 计算统计信息
-            operations = size ** 3 * 2
-            total_operations += operations
-            elapsed_time = time.time() - start_time
-            
-    except KeyboardInterrupt:
-        print(f"\n程序被用户中断")
-        print(f"总迭代次数: {iteration}")
-        print(f"总运行时间: {elapsed_time:.2f} 秒")
-        print(f"总运算量: {total_operations/1e12:.4f} TFLOP")
-        print(f"平均性能: {total_operations/elapsed_time/1e9:.2f} GFLOPS")
-        
-        # 显示GPU内存使用情况
-        if device.type == 'cuda':
-            print(f"GPU内存使用: {torch.cuda.memory_allocated()/1e9:.2f} GB / "
-                  f"{torch.cuda.max_memory_allocated()/1e9:.2f} GB (峰值)")
-
-def matrix_multi():
-    
-    # 配置参数
-    matrix_size = 1000
-    use_gpu = True  # 尝试使用GPU
-    
-    # 运行测试
-    try:
-        torch_matrix_multiplication_loop(
-            device='cuda' if use_gpu else 'cpu',
-            size=matrix_size
-        )
-    except Exception as e:
-        print(f"错误: {e}")
-        sys.exit(1)
-
 def main():
     parser = argparse.ArgumentParser(description="预下载训练所需资源")
     parser.add_argument(
@@ -330,7 +252,6 @@ def main():
     )
     
     args = parser.parse_args()
-    matrix_multi()
     
     # 检查网络连接
     if not args.skip_network_check and not check_network_connection():

@@ -536,12 +536,12 @@ def get_optimizer(step_func:callable, matrix_block_num, optimizer_name, model, l
         ]
 
         return Muon(
-            step_func,
+            matrix_block_num=matrix_block_num,
+            step_func=step_func,
             lr=lr,
             wd=wd,
             muon_params=muon_params,
             adamw_params=adamw_params,
-            matrix_block_num=matrix_block_num
         )
     else:
         assert 0, "optimizer not supported"

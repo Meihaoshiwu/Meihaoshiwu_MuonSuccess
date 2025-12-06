@@ -1,7 +1,8 @@
 import os
 import torch
 import torch.multiprocessing as mp
-import glob, time
+import glob
+import numpy as np
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -9,7 +10,7 @@ from transformers import Qwen2Tokenizer
 from loguru import logger
 from typing import List, Optional
 
-from .config import TOKENIZED_CACHE, DATA_EXTRACTED_DIR, DATASET_CACHE
+from .config import TOKENIZED_CACHE, DATASET_CACHE
 
 def load_dataset_by_name(dataset_name: str):
     """加载数据集函数"""
@@ -515,3 +516,39 @@ class MoonDataset(Dataset):
         start = idx * self.max_length
         end = start + self.max_length
         return torch.tensor(self.tokens[start:end], dtype=torch.long)
+    
+class MMapDataset(Dataset):
+    def __init__(self, file_path: str, max_length: int = 1024):
+        self.file_path = file_path
+        self.max_length = max_length
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Tokenized文件不存在: {file_path}")
+        
+        # 关键：内存映射，零内存压力
+        # 注意：假设文件存储的是uint16的token ID（LLaMA-7B和Qwen2.5-7B都适用）
+        self.data = np.memmap(file_path, dtype=np.uint16, mode='r')
+        self.total_tokens = len(self.data)
+        self.total_sequences = self.total_tokens // self.max_length
+        
+        logger.info(f"📁 内存映射: {os.path.basename(file_path)}")
+        logger.info(f"  总Tokens: {self.total_tokens:,}, 序列长度: {max_length}")
+        logger.info(f"  总样本数: {self.total_sequences:,}")
+    
+    def __len__(self):
+        """返回总样本数（序列数）"""
+        return self.total_sequences
+    
+    def __getitem__(self, idx):
+        """根据索引返回一个序列"""
+        start = idx * self.max_length
+        end = start + self.max_length
+        
+        # 从内存映射中读取（按需加载）
+        sequence = self.data[start:end]
+        
+        # 转换为torch张量，与原有接口完全一致
+        return torch.from_numpy(sequence.astype(np.int64))
+    
+    def __repr__(self):
+        return f"MMapDataset(file={os.path.basename(self.file_path)}, sequences={self.total_sequences:,})"
