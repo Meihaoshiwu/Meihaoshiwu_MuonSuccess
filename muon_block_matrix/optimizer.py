@@ -111,24 +111,37 @@ def step_row_random_process_one_block(G, steps):
     
     return result
 
+def singular_value_range(matrix):
+    """计算矩阵的奇异值范围"""
+    # 直接在GPU上计算奇异值
+    _, singular_values, _ = torch.linalg.svd(matrix, full_matrices=False)
+    min_sv = singular_values.min().item()
+    max_sv = singular_values.max().item()
+    return min_sv, max_sv
+
 def estimate_svd_weights_and_process(G, steps):
     """
     对原始矩阵G分块估计奇异值之和，得到权重
     然后将权重乘到处理之后的矩阵上
     """
     rows = G.shape[0]  # 总行数
-    block_size = rows // 4
-    num_samples=10
-    
-    # 1. 分割原始矩阵G为4个块
+    matrix_block_num=16
+    # 矩阵太小没必要分块
+    if matrix_block_num*matrix_block_num > rows:
+        logger.info(f"Warning: 矩阵{rows}行，要求分成{matrix_block_num}块，将作为整体处理")
+        return process_block(G, steps), 0, 0
+
+    block_size = rows // matrix_block_num
+    num_samples=20
+
     original_blocks = []
-    for i in range(4):
-        if i < 3:
+    for i in range(matrix_block_num):
+        if i < matrix_block_num-1:
             start_row = i * block_size
             end_row = (i + 1) * block_size
             block = G[start_row:end_row, :]
         else:
-            start_row = 3 * block_size
+            start_row = (matrix_block_num-1) * block_size
             block = G[start_row:, :]
         original_blocks.append(block)
     
@@ -137,6 +150,13 @@ def estimate_svd_weights_and_process(G, steps):
     for block in original_blocks:
         sv_est = randomized_nuclear_norm_estimate_fast(block, num_samples)
         sv_estimates.append(sv_est)
+    sv_accumulate = []
+    for block in original_blocks:
+        sv_acc_min, sv_acc_max = singular_value_range(block)
+        sv_accumulate.append(sv_acc_min)
+        sv_accumulate.append(sv_acc_max)
+    logger.info(f"sv_estimates (随机核范数估计值): {[f'{x:.3e}' for x in sv_estimates]}")
+    logger.info(f"sv_accumulate (每个块的最大奇异值): {[f'{x:.3e}' for x in sv_accumulate]}")
     
     # 3. 计算权重（每个块的奇异值之和占总和的比例）
     sv_estimates_tensor = torch.tensor(sv_estimates, device=G.device, dtype=G.dtype)
@@ -146,11 +166,10 @@ def estimate_svd_weights_and_process(G, steps):
     else:
         weights = torch.ones_like(sv_estimates_tensor) / len(sv_estimates_tensor)
         logger.error("警告：所有块的奇异值估计都为零，使用均匀权重")
-    
-    # 4. 再次处理每个块，但这次使用原始矩阵计算好的权重
+
     result = torch.zeros_like(G)
-    for i in range(4):
-        if i < 3:
+    for i in range(matrix_block_num):
+        if i < matrix_block_num-1:
             start_row = i * block_size
             end_row = (i + 1) * block_size
             # 对每个块进行正交化处理
@@ -159,9 +178,9 @@ def estimate_svd_weights_and_process(G, steps):
             weighted_block = processed_block * weights[i]
             result[start_row:end_row, :] = weighted_block
         else:
-            start_row = 3 * block_size
-            processed_block = process_block(original_blocks[3], steps)
-            weighted_block = processed_block * weights[3]
+            start_row = (matrix_block_num-1) * block_size
+            processed_block = process_block(original_blocks[matrix_block_num-1], steps)
+            weighted_block = processed_block * weights[matrix_block_num-1]
             result[start_row:, :] = weighted_block
     
     return result
